@@ -1,0 +1,23 @@
+from __future__ import annotations
+
+import sys
+
+from PyQt6.QtWidgets import QApplication
+
+from src.app import AppShell
+from src.state import PipelineState
+from src.theme import DARK_QSS
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    app.setApplicationName("llama-cut")
+    app.setStyleSheet(DARK_QSS)
+    state = PipelineState()
+    window = AppShell(state)
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
