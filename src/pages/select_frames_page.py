@@ -10,23 +10,33 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListView,
+    QPlainTextEdit,
+    QProgressBar,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
+from ..context import ContextStore, ContextType
+from ..frame_analysis import FrameAnalysisSettings, is_config_valid
 from ..state import Frame
 from ..theme import SPACING_LG, SPACING_MD, SPACING_SM
+from ..workers.frame_analysis_worker import FrameAnalysisWorker
 from .widgets import ThumbDelegate
 
 
 class SelectFramesPage(QWidget):
-    """Stage 3 — show all extracted frames, filter by video, select."""
+    """Stage 5 — show all extracted frames, filter by video, select,
+    and analyse each selected frame with an Ollama vision model."""
 
     def __init__(self, state, parent=None):
         super().__init__(parent)
         self._state = state
         self._filter_video: str | None = None
+        self._context_store: ContextStore | None = None
+        self._worker: FrameAnalysisWorker | None = None
+        self._loading = False
         self._build()
         self._connect()
 
@@ -78,21 +88,71 @@ class SelectFramesPage(QWidget):
         self.view.clicked.connect(self._on_item_clicked)
         root.addWidget(self.view, 1)
 
+        root.addWidget(self._build_progress_block())
+
         footer = QHBoxLayout()
+        footer.addWidget(QLabel("Concurrency:"))
+        self.concurrency_spin = QSpinBox()
+        self.concurrency_spin.setRange(1, 8)
+        self.concurrency_spin.setFixedWidth(72)
+        self.concurrency_spin.setToolTip(
+            "Number of concurrent Ollama API calls."
+        )
+        self.concurrency_spin.valueChanged.connect(self._on_concurrency_changed)
+        footer.addWidget(self.concurrency_spin)
         footer.addStretch()
         self.back_btn = QPushButton("Back")
         self.back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.back_btn.clicked.connect(lambda: self._state.set_stage(4))
         footer.addWidget(self.back_btn)
+        self.analyse_btn = QPushButton("Analyse")
+        self.analyse_btn.setProperty("class", "primary")
+        self.analyse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.analyse_btn.clicked.connect(self._on_analyse)
+        footer.addWidget(self.analyse_btn)
         root.addLayout(footer)
+
+    def _build_progress_block(self) -> QWidget:
+        block = QFrame()
+        block.setProperty("class", "card")
+        lay = QVBoxLayout(block)
+        lay.setContentsMargins(SPACING_MD, SPACING_MD, SPACING_MD, SPACING_MD)
+        lay.setSpacing(SPACING_SM)
+        self.progress_label = QLabel("")
+        self.progress_label.setProperty("class", "label-md")
+        lay.addWidget(self.progress_label)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        lay.addWidget(self.progress_bar)
+        self.log_box = QPlainTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setFixedHeight(120)
+        self.log_box.setProperty("class", "body-sm")
+        lay.addWidget(self.log_box)
+        block.setVisible(False)
+        self._progress_block = block
+        return block
 
     def _connect(self) -> None:
         self._state.frames_changed.connect(self._on_frames_changed)
 
     # --- Lifecycle ----------------------------------------------------------
     def on_enter(self) -> None:
+        self._context_store = ContextStore(
+            Path(self._state.working_folder) / "context"
+        ) if self._state.working_folder else None
         self._populate_video_filter()
         self._populate()
+        # load concurrency from state without triggering the changed signal
+        self._loading = True
+        try:
+            self.concurrency_spin.setValue(
+                self._state.frame_analysis_settings.concurrency
+            )
+        finally:
+            self._loading = False
+        self._update_button_state()
 
     def _on_frames_changed(self) -> None:
         self._populate_video_filter()
@@ -150,18 +210,21 @@ class SelectFramesPage(QWidget):
         new_state = Qt.CheckState.Unchecked if current else Qt.CheckState.Checked
         self.model.setData(idx, new_state, Qt.ItemDataRole.CheckStateRole)
         self._update_count()
+        self._update_button_state()
 
     def _on_select_all(self) -> None:
         for row in range(self.model.rowCount()):
             self.model.setData(self.model.index(row, 0),
                                Qt.CheckState.Checked, Qt.ItemDataRole.CheckStateRole)
         self._update_count()
+        self._update_button_state()
 
     def _on_select_none(self) -> None:
         for row in range(self.model.rowCount()):
             self.model.setData(self.model.index(row, 0),
                                Qt.CheckState.Unchecked, Qt.ItemDataRole.CheckStateRole)
         self._update_count()
+        self._update_button_state()
 
     def _update_count(self) -> None:
         sel = sum(
@@ -170,6 +233,102 @@ class SelectFramesPage(QWidget):
         )
         total = self.model.rowCount()
         self.count_label.setText(f"{sel} of {total} selected")
+
+    # --- Concurrency setting ------------------------------------------------
+    def _on_concurrency_changed(self, value: int) -> None:
+        if self._loading:
+            return
+        self._state.set_frame_analysis_settings(FrameAnalysisSettings(concurrency=value))
+
+    # --- Analyse ------------------------------------------------------------
+    def _selected_frames(self) -> list[Frame]:
+        """Return the Frame objects the user has checked, in chronological order."""
+        if self._filter_video is not None:
+            # When a filter is active, the visible set is the filter subset.
+            frame_by_path = {f.path: f for f in self._state.frames
+                             if f.video_path == self._filter_video}
+        else:
+            frame_by_path = {f.path: f for f in self._state.frames}
+        paths: list[str] = []
+        for row in range(self.model.rowCount()):
+            idx = self.model.index(row, 0)
+            if idx.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked:
+                p = idx.data(Qt.ItemDataRole.UserRole + 1)
+                if p in frame_by_path:
+                    paths.append(p)
+        frames = [frame_by_path[p] for p in paths]
+        # Chronological order: by video_path first-seen, then pts_time.
+        return sorted(frames, key=lambda f: (f.video_path, f.pts_time))
+
+    def _is_busy(self) -> bool:
+        return self._worker is not None and self._worker.isRunning()
+
+    def _update_button_state(self) -> None:
+        sel = self._selected_frames()
+        busy = self._is_busy()
+        self.analyse_btn.setEnabled(bool(sel) and not busy)
+        self.back_btn.setEnabled(not busy)
+        self.concurrency_spin.setEnabled(not busy)
+        self.select_all_btn.setEnabled(not busy)
+        self.select_none_btn.setEnabled(not busy)
+        self.video_filter.setEnabled(not busy)
+
+    def _on_analyse(self) -> None:
+        if self._is_busy():
+            return
+        ok, msg = is_config_valid()
+        if not ok:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Configuration missing", msg)
+            return
+        frames = self._selected_frames()
+        if not frames:
+            return
+        if self._context_store is None:
+            return
+
+        # Load project context + per-video video context once for the run.
+        project_doc = self._context_store.get(None, ContextType.PROJECT)
+        project_ctx = project_doc.content if project_doc else ""
+        video_contexts: dict[str, str] = {}
+        for stem in {f.video_stem for f in frames}:
+            vdoc = self._context_store.get(stem, ContextType.VIDEO)
+            video_contexts[stem] = vdoc.content if vdoc else ""
+
+        self._progress_block.setVisible(True)
+        self.progress_bar.setRange(0, len(frames))
+        self.progress_bar.setValue(0)
+        self.log_box.clear()
+        self.analyse_btn.setEnabled(False)
+        self.back_btn.setEnabled(False)
+        self.concurrency_spin.setEnabled(False)
+        s = self._state.frame_analysis_settings
+        self._worker = FrameAnalysisWorker(
+            frames, s, project_ctx, video_contexts, self._context_store, self,
+        )
+        self._worker.progress.connect(self._on_progress)
+        self._worker.log.connect(self._on_log)
+        self._worker.frame_finished.connect(self._on_frame_finished)
+        self._worker.finished_all.connect(self._on_finished)
+        self._worker.start()
+
+    def _on_progress(self, done, total, msg) -> None:
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(done)
+        self.progress_label.setText(msg)
+
+    def _on_log(self, msg: str) -> None:
+        self.log_box.appendPlainText(msg)
+
+    def _on_frame_finished(self, frame, section_text) -> None:
+        pass  # progress handled by the progress signal
+
+    def _on_finished(self, any_failed: bool) -> None:
+        self._update_button_state()
+        if not any_failed:
+            self.progress_label.setText("Frame analysis complete.")
+        else:
+            self.progress_label.setText("Completed with errors.")
 
 
 def _pts_label(pts: float) -> str:

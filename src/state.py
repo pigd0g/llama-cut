@@ -7,6 +7,7 @@ from typing import Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from .frame_analysis import FrameAnalysisSettings
 from .transcription import TranscriptionSettings
 
 
@@ -100,6 +101,7 @@ class PipelineState(QObject):
     frames_changed = pyqtSignal()
     stage_changed = pyqtSignal(int)
     transcription_settings_changed = pyqtSignal()
+    frame_analysis_settings_changed = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -107,6 +109,7 @@ class PipelineState(QObject):
         self._videos: list[Video] = []
         self._settings = ExtractSettings()
         self._transcription_settings = TranscriptionSettings()
+        self._frame_analysis_settings = FrameAnalysisSettings()
         self._frames: list[Frame] = []
         self._stage: int = 0  # 0=welcome, 1..5 = stages
 
@@ -197,6 +200,15 @@ class PipelineState(QObject):
         self.persist()
 
     @property
+    def frame_analysis_settings(self) -> FrameAnalysisSettings:
+        return self._frame_analysis_settings
+
+    def set_frame_analysis_settings(self, settings: FrameAnalysisSettings) -> None:
+        self._frame_analysis_settings = settings
+        self.frame_analysis_settings_changed.emit()
+        self.persist()
+
+    @property
     def models_dir(self) -> Path:
         if not self._working_folder:
             return Path()
@@ -244,6 +256,7 @@ class PipelineState(QObject):
                 "stage": self._stage,
                 "settings": self._settings.to_dict(),
                 "transcription_settings": self._transcription_settings.to_dict(),
+                "frame_analysis_settings": self._frame_analysis_settings.to_dict(),
                 "videos": [v.to_dict() for v in self._videos],
                 "frames": [f.to_dict() for f in self._frames],
             }
@@ -264,12 +277,16 @@ class PipelineState(QObject):
             self._transcription_settings = TranscriptionSettings.from_dict(
                 data.get("transcription_settings", {})
             )
+            self._frame_analysis_settings = FrameAnalysisSettings.from_dict(
+                data.get("frame_analysis_settings", {})
+            )
             self._videos = [Video.from_dict(d) for d in data.get("videos", [])]
             self._frames = [Frame.from_dict(d) for d in data.get("frames", [])]
             self.videos_changed.emit()
             self.frames_changed.emit()
             self.settings_changed.emit()
             self.transcription_settings_changed.emit()
+            self.frame_analysis_settings_changed.emit()
         except Exception:
             pass
 
