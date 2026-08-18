@@ -114,7 +114,6 @@ def _rgba(palette, hex_str: str, alpha: float):
 
 def _font(painter, size: int, weight: int):
     f = QFont(painter.font())
-    f.setPointSize(10)
     f.setPixelSize(size)
     try:
         f.setWeight({

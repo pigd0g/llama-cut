@@ -26,3 +26,6 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Whisper model files (downloaded by the app, never committed)
+models/

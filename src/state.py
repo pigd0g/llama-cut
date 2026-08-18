@@ -7,6 +7,8 @@ from typing import Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from .transcription import TranscriptionSettings
+
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mpg", ".mpeg", ".ts"}
 
@@ -97,14 +99,16 @@ class PipelineState(QObject):
     extraction_finished = pyqtSignal(bool, str)
     frames_changed = pyqtSignal()
     stage_changed = pyqtSignal(int)
+    transcription_settings_changed = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
         self._working_folder: str = ""
         self._videos: list[Video] = []
         self._settings = ExtractSettings()
+        self._transcription_settings = TranscriptionSettings()
         self._frames: list[Frame] = []
-        self._stage: int = 0  # 0=welcome, 1..3 = stages
+        self._stage: int = 0  # 0=welcome, 1..5 = stages
 
     # --- Working folder -----------------------------------------------------
     @property
@@ -182,6 +186,22 @@ class PipelineState(QObject):
         self.settings_changed.emit()
         self.persist()
 
+    # --- Transcription settings --------------------------------------------
+    @property
+    def transcription_settings(self) -> TranscriptionSettings:
+        return self._transcription_settings
+
+    def set_transcription_settings(self, settings: TranscriptionSettings) -> None:
+        self._transcription_settings = settings
+        self.transcription_settings_changed.emit()
+        self.persist()
+
+    @property
+    def models_dir(self) -> Path:
+        if not self._working_folder:
+            return Path()
+        return Path(self._working_folder) / "models"
+
     # --- Frames -------------------------------------------------------------
     @property
     def frames(self) -> list[Frame]:
@@ -223,6 +243,7 @@ class PipelineState(QObject):
                 "working_folder": self._working_folder,
                 "stage": self._stage,
                 "settings": self._settings.to_dict(),
+                "transcription_settings": self._transcription_settings.to_dict(),
                 "videos": [v.to_dict() for v in self._videos],
                 "frames": [f.to_dict() for f in self._frames],
             }
@@ -240,11 +261,15 @@ class PipelineState(QObject):
             data = json.loads(f.read_text(encoding="utf-8"))
             self._stage = int(data.get("stage", 0))
             self._settings = ExtractSettings.from_dict(data.get("settings", {}))
+            self._transcription_settings = TranscriptionSettings.from_dict(
+                data.get("transcription_settings", {})
+            )
             self._videos = [Video.from_dict(d) for d in data.get("videos", [])]
             self._frames = [Frame.from_dict(d) for d in data.get("frames", [])]
             self.videos_changed.emit()
             self.frames_changed.emit()
             self.settings_changed.emit()
+            self.transcription_settings_changed.emit()
         except Exception:
             pass
 
