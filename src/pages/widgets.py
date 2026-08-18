@@ -47,7 +47,10 @@ class ThumbDelegate(QStyledItemDelegate):
             )
             x = thumb_rect.x() + (THUMB_W - scaled.width()) // 2
             y = thumb_rect.y() + (THUMB_H - scaled.height()) // 2
+            painter.save()
+            painter.setClipRect(thumb_rect)
             painter.drawPixmap(x, y, scaled)
+            painter.restore()
         else:
             painter.setBrush(_rgba(option.palette, COLOR_BORDER, 0.4))
             painter.setPen(Qt.PenStyle.NoPen)
