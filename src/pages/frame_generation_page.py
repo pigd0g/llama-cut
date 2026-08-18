@@ -73,7 +73,7 @@ class FrameGenerationPage(QWidget):
         footer.addStretch()
         self.back_btn = QPushButton("Back")
         self.back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.back_btn.clicked.connect(lambda: self._state.set_stage(1))
+        self.back_btn.clicked.connect(lambda: self._state.set_stage(2))
         footer.addWidget(self.back_btn)
         self.analyse_btn = QPushButton("Analyse")
         self.analyse_btn.setProperty("class", "primary")
@@ -321,7 +321,7 @@ class FrameGenerationPage(QWidget):
         self._state.set_frames(frames)
         self._state.save_frames_json(frames)
         if not any_failed and frames:
-            self._state.set_stage(3)
+            self._state.set_stage(4)
         else:
             self.progress_label.setText(
                 "Extraction completed with errors" if any_failed

@@ -21,31 +21,28 @@ from .theme import (
     SPACING_XL,
     SPACING_XS,
 )
+from .pages.context_page import ContextPage
 from .pages.frame_generation_page import FrameGenerationPage
 from .pages.select_frames_page import SelectFramesPage
 from .pages.select_videos_page import SelectVideosPage
 from .pages.welcome_page import WelcomePage
 
 
-NAV_ITEMS = [
-    ("Welcome", "select_videos", "\ue8cc", 0),   # folder icon
-    ("1 · Select Videos", "select_videos", "\ue8cc", 1),
-    ("2 · Frame Generation", "frame_gen", "\ue1bc", 2),  # movie icon
-    ("3 · Select Frames", "select_frames", "\ue413", 3), # photo_library
-]
-
-# Simpler, cleaner icon assignments using Material Symbols codepoints
+# Stage indices: 0=Welcome, 1=Select Videos, 2=Context, 3=Frame Generation,
+# 4=Select Frames
 NAV_ICONS = {
     0: "\ue8cc",  # folder
     1: "\ue8cc",  # folder
-    2: "\ue02a",  # video
-    3: "\ue413",  # photo_library
+    2: "\ue873",  # description / article
+    3: "\ue02a",  # video
+    4: "\ue413",  # photo_library
 }
 NAV_LABELS = {
     0: "Welcome",
     1: "1 · Select Videos",
-    2: "2 · Frame Generation",
-    3: "3 · Select Frames",
+    2: "2 · Context",
+    3: "3 · Frame Generation",
+    4: "4 · Select Frames",
 }
 
 
@@ -55,7 +52,7 @@ class AppShell(QMainWindow):
         self._state = state or PipelineState()
         self.setWindowTitle("llama-cut")
         self.setMinimumSize(1100, 720)
-        self.resize(1280, 800)
+        self.resize(1600, 860)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -72,12 +69,14 @@ class AppShell(QMainWindow):
         self.stack = QStackedWidget()
         self.welcome_page = WelcomePage(self._state)
         self.stage1 = SelectVideosPage(self._state)
-        self.stage2 = FrameGenerationPage(self._state)
-        self.stage3 = SelectFramesPage(self._state)
-        self.stack.addWidget(self.welcome_page)  # index 0
-        self.stack.addWidget(self.stage1)        # index 1
-        self.stack.addWidget(self.stage2)        # index 2
-        self.stack.addWidget(self.stage3)        # index 3
+        self.context_page = ContextPage(self._state)
+        self.stage3 = FrameGenerationPage(self._state)
+        self.stage4 = SelectFramesPage(self._state)
+        self.stack.addWidget(self.welcome_page)   # index 0
+        self.stack.addWidget(self.stage1)         # index 1
+        self.stack.addWidget(self.context_page)   # index 2
+        self.stack.addWidget(self.stage3)         # index 3
+        self.stack.addWidget(self.stage4)         # index 4
         right_col.addWidget(self.stack, 1)
         right_widget = QWidget()
         right_widget.setLayout(right_col)
@@ -129,7 +128,7 @@ class AppShell(QMainWindow):
         return bar
 
     def _build_nav_items(self) -> None:
-        for stage in (0, 1, 2, 3):
+        for stage in (0, 1, 2, 3, 4):
             btn = QToolButton()
             btn.setObjectName("sidebarNavItem")
             btn.setProperty("active", False)
@@ -188,9 +187,11 @@ class AppShell(QMainWindow):
         if stage == 1:
             self.stage1.refresh()
         elif stage == 2:
-            self.stage2.on_enter()
+            self.context_page.on_enter()
         elif stage == 3:
             self.stage3.on_enter()
+        elif stage == 4:
+            self.stage4.on_enter()
 
     def _on_nav_click(self, stage: int) -> None:
         if stage == 0:

@@ -82,7 +82,7 @@ class SelectFramesPage(QWidget):
         footer.addStretch()
         self.back_btn = QPushButton("Back")
         self.back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.back_btn.clicked.connect(lambda: self._state.set_stage(2))
+        self.back_btn.clicked.connect(lambda: self._state.set_stage(3))
         footer.addWidget(self.back_btn)
         root.addLayout(footer)
 

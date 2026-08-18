@@ -440,6 +440,48 @@ QToolTip {{
     border-radius: {RADIUS_SM}px;
     padding: {SPACING_XS}px {SPACING_SM}px;
 }}
+
+/* Context scope rows */
+QPushButton#scopeRow {{
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: {RADIUS_DEFAULT}px;
+    text-align: left;
+    color: {COLOR_ON_SURFACE};
+}}
+QPushButton#scopeRow:hover {{
+    background-color: {COLOR_SURFACE_CONTAINER};
+}}
+QPushButton#scopeRow[active="true"], QPushButton#scopeRow:checked {{
+    background-color: {COLOR_SURFACE_CONTAINER};
+    border-color: {COLOR_OUTLINE};
+}}
+
+/* Tab bar */
+QTabWidget::pane {{
+    border: 1px solid {COLOR_BORDER};
+    border-radius: {RADIUS_LG}px;
+    background-color: {COLOR_SURFACE};
+    top: -1px;
+}}
+QTabBar::tab {{
+    background: transparent;
+    color: {COLOR_ON_SURFACE_VARIANT};
+    padding: {SPACING_SM}px {SPACING_MD}px;
+    border: 1px solid transparent;
+    border-top-left-radius: {RADIUS_DEFAULT}px;
+    border-top-right-radius: {RADIUS_DEFAULT}px;
+    margin-right: 2px;
+}}
+QTabBar::tab:selected {{
+    background-color: {COLOR_SURFACE};
+    color: {COLOR_ON_SURFACE};
+    border-color: {COLOR_BORDER};
+    border-bottom-color: {COLOR_SURFACE};
+}}
+QTabBar::tab:hover:!selected {{
+    color: {COLOR_ON_SURFACE};
+}}
 """
 
 
