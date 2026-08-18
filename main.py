@@ -6,12 +6,13 @@ from PyQt6.QtWidgets import QApplication
 
 from src.app import AppShell
 from src.state import PipelineState
-from src.theme import DARK_QSS
+from src.theme import DARK_QSS, register_fonts
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("llama-cut")
+    register_fonts()
     app.setStyleSheet(DARK_QSS)
     state = PipelineState()
     window = AppShell(state)

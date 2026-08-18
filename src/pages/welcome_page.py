@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..icons import material_icon
 from ..theme import (
     COLOR_ON_SURFACE_VARIANT,
     COLOR_PRIMARY,
@@ -41,12 +42,8 @@ class WelcomePage(QWidget):
         cl.setContentsMargins(SPACING_XL, SPACING_XL, SPACING_XL, SPACING_XL)
         cl.setSpacing(SPACING_MD)
 
-        icon = QLabel("\ue2c6")  # folder_open material symbol
+        icon = material_icon("video_library", 56, COLOR_PRIMARY)
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon.setStyleSheet(
-            f"font-family: 'Material Symbols Outlined'; font-size: 56px; "
-            f"color: {COLOR_PRIMARY}; background: transparent;"
-        )
         cl.addWidget(icon)
 
         title = QLabel("Select a Working Folder")

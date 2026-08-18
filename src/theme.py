@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from PyQt6.QtGui import QColor, QFont, QFontDatabase
 
 # --- Design Tokens (Dark mode only for phase 1) ----------------------------
@@ -83,6 +85,15 @@ def apply_app_fonts() -> None:
     for family in (FONT_HEADING, FONT_BODY, FONT_ICONS):
         if QFontDatabase.hasFamily(family):
             continue
+
+
+def register_fonts() -> None:
+    """Register bundled font files (assets/fonts) with the application."""
+    fonts_dir = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+    if not fonts_dir.is_dir():
+        return
+    for font_file in sorted(fonts_dir.glob("*.ttf")) + sorted(fonts_dir.glob("*.otf")):
+        QFontDatabase.addApplicationFont(str(font_file))
 
 
 # --- QSS --------------------------------------------------------------------

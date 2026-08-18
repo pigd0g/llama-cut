@@ -32,6 +32,23 @@ This project is not a library — install with `pip`, not a package manager.
   (signal/slot architecture, QSS theming, QThread concurrency, layout management,
   cross-platform rendering, MVC separation).
 
+## Icons (Material Symbols)
+
+- Use the **`material_icon(name, size, color=None)`** helper from `src/icons.py` for all
+  Material Symbols icons. It renders the icon by **name** (ligature-based lookup), e.g.
+  `material_icon("video_library", 56, COLOR_PRIMARY)`.
+- **Never** use raw `\ue...` codepoints in `QLabel` text — the Material Symbols Outlined
+  font does not reliably map the old Material Icons codepoint lists, which can render
+  the wrong glyph (e.g. a telephone instead of a folder).
+- The helper sets font-family and font-size via an **inline stylesheet** — do not
+  override them with `setFont()` or a later `setStyleSheet()` call. The app-level QSS
+  `*` rule (`font-family: Inter`) overrides `QFont` set via `setFont()`, so only inline
+  styles (which beat app QSS) keep the icon font active.
+- Pass color through the helper's `color` param; use `setAlignment()` for alignment.
+- The font file lives at `assets/fonts/MaterialSymbolsOutlined.ttf` and is registered
+  at startup by `register_fonts()` in `src/theme.py` (called from `main.py`). If you
+  add new font files, put them in `assets/fonts/` — they are auto-registered.
+
 ## Skill Usage
 
 - Use **`pyqt6-ui-designer`** for any UI styling / design work.
