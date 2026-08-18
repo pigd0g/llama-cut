@@ -29,6 +29,9 @@ _MODEL_REQUIRED_FILES = [
 
 FFMPEG_SAMPLE_RATE = 16000
 
+# App root = directory containing main.py (this file lives in src/)
+_APP_ROOT = Path(__file__).resolve().parents[1]
+
 
 # --- Settings ---------------------------------------------------------------
 
@@ -241,9 +244,13 @@ def default_compute_type_for_device(device: str) -> str:
 
 # --- Model cache + presence -------------------------------------------------
 
-def model_cache_dir(working_folder: str) -> Path:
-    """Return <working_folder>/models — where Whisper model files are cached."""
-    return Path(working_folder) / "models"
+def model_cache_dir() -> Path:
+    """Return the application-wide models directory (<app_root>/models).
+
+    Models are stored once at the application level so they are shared
+    across all projects / working folders and only downloaded once.
+    """
+    return _APP_ROOT / "models"
 
 
 def _model_dir(model: str, cache_dir: Path) -> Path:

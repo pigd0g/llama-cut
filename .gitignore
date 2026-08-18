@@ -27,5 +27,5 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Whisper model files (downloaded by the app, never committed)
+# Whisper model files (app-level cache, shared across projects, never committed)
 models/

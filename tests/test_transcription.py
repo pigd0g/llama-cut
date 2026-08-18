@@ -246,9 +246,9 @@ def test_supported_models():
 
 # --- Model cache + presence -------------------------------------------------
 
-def test_model_cache_dir(tmp_path):
-    d = model_cache_dir(str(tmp_path))
-    assert d == tmp_path / "models"
+def test_model_cache_dir():
+    d = model_cache_dir()
+    assert d.name == "models"
 
 
 def test_is_model_present_false_for_missing_dir(tmp_path):

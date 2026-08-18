@@ -8,7 +8,7 @@ from typing import Optional
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from .frame_analysis import FrameAnalysisSettings
-from .transcription import TranscriptionSettings
+from .transcription import TranscriptionSettings, model_cache_dir
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mpg", ".mpeg", ".ts"}
@@ -210,9 +210,7 @@ class PipelineState(QObject):
 
     @property
     def models_dir(self) -> Path:
-        if not self._working_folder:
-            return Path()
-        return Path(self._working_folder) / "models"
+        return model_cache_dir()
 
     # --- Frames -------------------------------------------------------------
     @property
