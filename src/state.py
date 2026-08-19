@@ -8,6 +8,7 @@ from typing import Optional
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from .frame_analysis import FrameAnalysisSettings
+from .storyboard import StoryboardSettings
 from .transcription import TranscriptionSettings, model_cache_dir
 
 
@@ -102,6 +103,7 @@ class PipelineState(QObject):
     stage_changed = pyqtSignal(int)
     transcription_settings_changed = pyqtSignal()
     frame_analysis_settings_changed = pyqtSignal()
+    storyboard_settings_changed = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -110,6 +112,7 @@ class PipelineState(QObject):
         self._settings = ExtractSettings()
         self._transcription_settings = TranscriptionSettings()
         self._frame_analysis_settings = FrameAnalysisSettings()
+        self._storyboard_settings = StoryboardSettings()
         self._frames: list[Frame] = []
         self._stage: int = 0  # 0=welcome, 1..5 = stages
 
@@ -209,6 +212,15 @@ class PipelineState(QObject):
         self.persist()
 
     @property
+    def storyboard_settings(self) -> StoryboardSettings:
+        return self._storyboard_settings
+
+    def set_storyboard_settings(self, settings: StoryboardSettings) -> None:
+        self._storyboard_settings = settings
+        self.storyboard_settings_changed.emit()
+        self.persist()
+
+    @property
     def models_dir(self) -> Path:
         return model_cache_dir()
 
@@ -255,6 +267,7 @@ class PipelineState(QObject):
                 "settings": self._settings.to_dict(),
                 "transcription_settings": self._transcription_settings.to_dict(),
                 "frame_analysis_settings": self._frame_analysis_settings.to_dict(),
+                "storyboard_settings": self._storyboard_settings.to_dict(),
                 "videos": [v.to_dict() for v in self._videos],
                 "frames": [f.to_dict() for f in self._frames],
             }
@@ -278,6 +291,9 @@ class PipelineState(QObject):
             self._frame_analysis_settings = FrameAnalysisSettings.from_dict(
                 data.get("frame_analysis_settings", {})
             )
+            self._storyboard_settings = StoryboardSettings.from_dict(
+                data.get("storyboard_settings", {})
+            )
             self._videos = [Video.from_dict(d) for d in data.get("videos", [])]
             self._frames = [Frame.from_dict(d) for d in data.get("frames", [])]
             self.videos_changed.emit()
@@ -285,6 +301,7 @@ class PipelineState(QObject):
             self.settings_changed.emit()
             self.transcription_settings_changed.emit()
             self.frame_analysis_settings_changed.emit()
+            self.storyboard_settings_changed.emit()
         except Exception:
             pass
 

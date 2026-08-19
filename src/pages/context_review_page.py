@@ -105,6 +105,11 @@ class ContextReviewPage(QWidget):
         self.export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.export_btn.clicked.connect(self._on_export)
         footer.addWidget(self.export_btn)
+        self.storyboard_btn = QPushButton("Storyboard")
+        self.storyboard_btn.setProperty("class", "primary")
+        self.storyboard_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.storyboard_btn.clicked.connect(lambda: self._state.set_stage(7))
+        footer.addWidget(self.storyboard_btn)
         root.addLayout(footer)
 
     def resizeEvent(self, event) -> None:

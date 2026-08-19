@@ -46,7 +46,7 @@ class SelectFramesPage(QWidget):
         root.setSpacing(SPACING_MD)
 
         header = QHBoxLayout()
-        title = QLabel("Select Frames")
+        title = QLabel("Analyse Frames")
         title.setProperty("class", "headline-md")
         header.addWidget(title)
         header.addStretch()
