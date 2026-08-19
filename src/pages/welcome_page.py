@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -76,6 +77,14 @@ class WelcomePage(QWidget):
         btn_row.addStretch()
         cl.addLayout(btn_row)
 
+        # Loading indicator (hidden by default)
+        self.loading_label = QLabel("Loading…")
+        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.loading_label.setProperty("class", "body-md")
+        self.loading_label.setStyleSheet(f"color: {COLOR_ON_SURFACE_VARIANT};")
+        self.loading_label.setVisible(False)
+        cl.addWidget(self.loading_label)
+
         center.addWidget(card)
         center.addStretch()
         root.addLayout(center)
@@ -86,6 +95,20 @@ class WelcomePage(QWidget):
             self, "Select Working Folder", "",
             QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontResolveSymlinks,
         )
-        if folder:
-            self._state.set_working_folder(folder)
-            self._state.set_stage(1)
+        if not folder:
+            return
+        # Show the loading indicator and disable the button immediately so
+        # the user sees feedback before the (potentially slow) folder scan +
+        # state load runs.  Force a repaint so the loading state is visibly
+        # drawn on screen, then defer the heavy work with a short delay so the
+        # event loop has time to process the paint before we block.
+        self.select_btn.setEnabled(False)
+        self.loading_label.setVisible(True)
+        self.loading_label.repaint()
+        QApplication.processEvents()
+        QTimer.singleShot(50, lambda: self._apply_folder(folder))
+
+    def _apply_folder(self, folder: str) -> None:
+        # set_working_folder triggers _on_folder_changed in app.py which
+        # loads state, refreshes stage 1, and forces the stage to 1.
+        self._state.set_working_folder(folder)

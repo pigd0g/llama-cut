@@ -211,7 +211,7 @@ class StoryboardPage(QWidget):
         _prompt_h = 4 * _line_h + 2 * SPACING_MD + 8  # 4 lines + padding + slack
         self.prompt_input.setFixedHeight(_prompt_h)
         self.prompt_input.setSizePolicy(
-            self.prompt_input.sizePolicy().Policy.Fixed,
+            self.prompt_input.sizePolicy().Policy.Expanding,
             self.prompt_input.sizePolicy().Policy.Fixed,
         )
         self.prompt_input.setProperty("class", "body-md")

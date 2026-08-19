@@ -244,8 +244,8 @@ class PipelineState(QObject):
     def stage(self) -> int:
         return self._stage
 
-    def set_stage(self, stage: int) -> None:
-        if stage == self._stage:
+    def set_stage(self, stage: int, force: bool = False) -> None:
+        if stage == self._stage and not force:
             return
         self._stage = stage
         self.stage_changed.emit(stage)

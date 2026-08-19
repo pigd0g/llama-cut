@@ -186,9 +186,9 @@ class AppShell(QMainWindow):
             self._state.load()
             # refresh stage 1
             self.stage1.refresh()
-            # jump to stage 1 if we were on welcome
-            if self._state.stage == 0:
-                self._state.set_stage(1)
+            # jump to stage 1 — always force it so the stack switches even
+            # if load() restored the same stage value internally.
+            self._state.set_stage(1, force=True)
         else:
             self.folder_label.setText("No folder selected")
 
