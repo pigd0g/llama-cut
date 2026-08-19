@@ -10,6 +10,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from .frame_analysis import FrameAnalysisSettings
 from .storyboard import StoryboardSettings
 from .transcription import TranscriptionSettings, model_cache_dir
+from .video_production import VideoProductionSettings
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mpg", ".mpeg", ".ts"}
@@ -104,6 +105,7 @@ class PipelineState(QObject):
     transcription_settings_changed = pyqtSignal()
     frame_analysis_settings_changed = pyqtSignal()
     storyboard_settings_changed = pyqtSignal()
+    video_production_settings_changed = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -113,6 +115,7 @@ class PipelineState(QObject):
         self._transcription_settings = TranscriptionSettings()
         self._frame_analysis_settings = FrameAnalysisSettings()
         self._storyboard_settings = StoryboardSettings()
+        self._video_production_settings = VideoProductionSettings()
         self._frames: list[Frame] = []
         self._stage: int = 0  # 0=welcome, 1..5 = stages
 
@@ -221,6 +224,15 @@ class PipelineState(QObject):
         self.persist()
 
     @property
+    def video_production_settings(self) -> VideoProductionSettings:
+        return self._video_production_settings
+
+    def set_video_production_settings(self, settings: VideoProductionSettings) -> None:
+        self._video_production_settings = settings
+        self.video_production_settings_changed.emit()
+        self.persist()
+
+    @property
     def models_dir(self) -> Path:
         return model_cache_dir()
 
@@ -268,6 +280,7 @@ class PipelineState(QObject):
                 "transcription_settings": self._transcription_settings.to_dict(),
                 "frame_analysis_settings": self._frame_analysis_settings.to_dict(),
                 "storyboard_settings": self._storyboard_settings.to_dict(),
+                "video_production_settings": self._video_production_settings.to_dict(),
                 "videos": [v.to_dict() for v in self._videos],
                 "frames": [f.to_dict() for f in self._frames],
             }
@@ -294,6 +307,9 @@ class PipelineState(QObject):
             self._storyboard_settings = StoryboardSettings.from_dict(
                 data.get("storyboard_settings", {})
             )
+            self._video_production_settings = VideoProductionSettings.from_dict(
+                data.get("video_production_settings", {})
+            )
             self._videos = [Video.from_dict(d) for d in data.get("videos", [])]
             self._frames = [Frame.from_dict(d) for d in data.get("frames", [])]
             self.videos_changed.emit()
@@ -302,6 +318,7 @@ class PipelineState(QObject):
             self.transcription_settings_changed.emit()
             self.frame_analysis_settings_changed.emit()
             self.storyboard_settings_changed.emit()
+            self.video_production_settings_changed.emit()
         except Exception:
             pass
 

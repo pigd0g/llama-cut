@@ -113,6 +113,11 @@ class StoryboardPage(QWidget):
         self.export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.export_btn.clicked.connect(self._on_export)
         footer.addWidget(self.export_btn)
+        self.produce_btn = QPushButton("Produce Video")
+        self.produce_btn.setProperty("class", "primary")
+        self.produce_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.produce_btn.clicked.connect(lambda: self._state.set_stage(8))
+        footer.addWidget(self.produce_btn)
         root.addLayout(footer)
 
     def _build_progress_block(self) -> QWidget:
@@ -408,6 +413,7 @@ class StoryboardPage(QWidget):
         self.back_btn.setEnabled(False)
         self.export_btn.setEnabled(False)
         self.reset_btn.setEnabled(False)
+        self.produce_btn.setEnabled(False)
         if hasattr(self, "edit_toggle") and self.edit_toggle is not None:
             self.edit_toggle.setEnabled(False)
 
@@ -455,6 +461,7 @@ class StoryboardPage(QWidget):
         self.back_btn.setEnabled(True)
         self.export_btn.setEnabled(has_storyboard)
         self.reset_btn.setEnabled(has_storyboard)
+        self.produce_btn.setEnabled(has_storyboard)
         # edit_toggle may be None if the storyboard card doesn't exist yet
         # (e.g. after reset when no storyboard is present).
         if hasattr(self, "edit_toggle") and self.edit_toggle is not None:

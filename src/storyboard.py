@@ -61,6 +61,7 @@ Identify and use the best available moments from the source footage, including:
 Where possible, reference the source video and timestamp when recommending footage.
 
 Do not invent footage, dialogue, events, people, locations, or visual content that is not supported by the provided context.
+Do not intentionally overlap or repeat footage unless the context indicates that it is appropriate and the user specifies that it is desired.
 
 If the available footage does not contain something required by the user's concept, clearly identify the gap rather than inventing a clip.
 
