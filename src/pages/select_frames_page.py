@@ -110,6 +110,11 @@ class SelectFramesPage(QWidget):
         self.analyse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.analyse_btn.clicked.connect(self._on_analyse)
         footer.addWidget(self.analyse_btn)
+        self.review_btn = QPushButton("Review Context")
+        self.review_btn.setProperty("class", "primary")
+        self.review_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.review_btn.clicked.connect(lambda: self._state.set_stage(6))
+        footer.addWidget(self.review_btn)
         root.addLayout(footer)
 
     def _build_progress_block(self) -> QWidget:
