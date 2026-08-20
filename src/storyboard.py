@@ -200,17 +200,24 @@ _EMPTY_FRAME_ANALYSIS = "_Not yet generated._"
 
 def build_context_markdown(project_ctx: str,
                             video_sections: list,
-                            video_metadatas: list) -> str:
+                            video_metadatas: list,
+                            working_folder: str = "") -> str:
     """Assemble all available context into a single structured Markdown document.
 
     ``video_sections`` is a list of ``context_review.VideoSection`` objects
     (from ``load_assembled``). ``video_metadatas`` is a list of
-    ``VideoMetadata`` objects.
+    ``VideoMetadata`` objects. ``working_folder`` is the project folder used
+    to scan for available background-music files (audio files placed in the
+    working folder are surfaced to the storyboard and editor).
 
     The structure is:
 
       # Project Context
       <project content>
+
+      # Available Music Files
+      - <audio filename>
+      ...
 
       # Video Metadata
       ## <video1 filename>
@@ -241,6 +248,22 @@ def build_context_markdown(project_ctx: str,
     pbody = _strip_leading_heading(project_ctx, "# Project Context").strip()
     parts.append(pbody if pbody else _EMPTY_PROJECT)
     parts.append("")
+
+    # --- Available Music Files ---
+    # Audio files in the working folder (e.g. background music) are surfaced
+    # so the storyboard and editor can reference them by exact filename.
+    if working_folder:
+        from .state import AUDIO_EXTENSIONS
+        music_files = _list_audio_files(working_folder, AUDIO_EXTENSIONS)
+        if music_files:
+            parts.append("# Available Music Files")
+            parts.append("")
+            parts.append("Audio files in the project folder that can be used "
+                         "as background music. Reference them by exact filename.")
+            parts.append("")
+            for name in music_files:
+                parts.append(f"- `{name}`")
+            parts.append("")
 
     # --- Video Metadata ---
     if video_metadatas:
@@ -275,6 +298,25 @@ def build_context_markdown(project_ctx: str,
         parts.append("")
 
     return "\n".join(parts).rstrip() + "\n"
+
+
+def _list_audio_files(working_folder: str, extensions: set[str]) -> list[str]:
+    """Return a sorted list of audio filenames in the working folder.
+
+    Only top-level files (not subdirectories) whose suffix matches one of the
+    given extensions are returned. Returns [] if the folder is missing or no
+    audio files are found.
+    """
+    if not working_folder:
+        return []
+    p = Path(working_folder)
+    if not p.is_dir():
+        return []
+    out: list[str] = []
+    for entry in sorted(p.iterdir()):
+        if entry.is_file() and entry.suffix.lower() in extensions:
+            out.append(entry.name)
+    return out
 
 
 # --- Prompt building --------------------------------------------------------

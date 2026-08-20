@@ -139,6 +139,7 @@ class VideoProductionWorker(QThread):
             project_ctx=doc.project_context,
             video_sections=doc.videos,
             video_metadatas=metadatas,
+            working_folder=self._working_folder,
         )
         self.log.emit(f"Context assembled ({len(context_md)} chars).")
 

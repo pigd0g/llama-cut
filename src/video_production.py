@@ -313,7 +313,7 @@ This is intentional: keeping transition clips on disk as separate files \
 
 ### Assembly
 - Pass ONLY shot clips to assemble_timeline() in the `clips` list. Do NOT \
-include transition clips (created by create_transition) in `clips` — \
+include transition clips (created by create_transition) in `clips`` — \
 describe transitions in the separate `transitions` parameter.
 - The `transitions` array uses `after` to identify which shot a transition \
 follows; the transition is applied between that shot and the next shot in \
@@ -322,6 +322,15 @@ storyboard id.
 - If assemble_timeline fails, read the error and simplify: reduce the \
 clips list to shot clips only, ensure all clip names exist on disk, and \
 verify transition `after` values match clip names in the list.
+
+### Background Music
+- Audio files (e.g. .mp3, .wav, .m4a) placed in the project folder can be \
+mixed in as background music via mix_audio(). Pass the music filename in the \
+`audio_sources` list.
+- The available music files are listed in the provided context under \
+"Available Music Files". Reference a music file by its exact filename.
+- Only use music the user has explicitly requested. Do not add background \
+music unless the storyboard or user brief calls for it.
 
 ## General Rules
 
@@ -1293,7 +1302,10 @@ class ToolRegistry:
 
         Args:
             video_clip: Name of the video clip to mix audio into.
-            audio_sources: List of audio source clip names.
+            audio_sources: List of audio source names. These may be
+                intermediate clips OR background-music files from the project
+                folder (e.g. 'background.mp3'). Reference music files by their
+                exact filename.
             volumes: List of volume multipliers (0.0-2.0), one per audio source.
             fades: Optional dict with 'fade_in' and 'fade_out' durations.
             normalization: If true, apply loudnorm normalization.
@@ -1990,19 +2002,41 @@ class ToolRegistry:
         return None
 
     def _resolve_clip(self, name: str) -> Path | None:
-        """Resolve a clip name to its file path.
+        """Resolve a clip/audio name to its file path.
 
-        Checks intermediate clips first, then the clips directory.
+        Resolution order:
+          1. intermediate clips (in-memory map from this run)
+          2. the clips directory (video + audio extensions)
+          3. the working folder root (audio files only — e.g. background
+             music placed in the project folder)
+
+        This lets mix_audio reference a music file by its exact filename
+        (e.g. 'background.mp3') without it having to be an intermediate clip.
         """
         if name in self._intermediate_clips:
             p = Path(self._intermediate_clips[name])
             if p.exists():
                 return p
 
-        for ext in (".mp4", ".mov", ".mkv", ".avi", ".webm"):
+        from .state import AUDIO_EXTENSIONS
+
+        # Clips dir: try the bare name with any video/audio extension.
+        for ext in (".mp4", ".mov", ".mkv", ".avi", ".webm") + tuple(AUDIO_EXTENSIONS):
             p = self._clips_dir / f"{name}{ext}"
             if p.exists():
                 return p
+
+        # Working folder root: audio files only (background music).
+        for ext in tuple(AUDIO_EXTENSIONS):
+            p = self._working_folder / f"{name}{ext}"
+            if p.exists():
+                return p
+
+        # Last resort: the name may already include its extension.
+        p = self._working_folder / name
+        if p.exists() and p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS:
+            return p
+
         return None
 
     def _probe_duration(self, path: Path) -> float:

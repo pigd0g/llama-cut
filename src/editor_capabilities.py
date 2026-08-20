@@ -42,6 +42,10 @@ aspect ratio (for example 16:9 or 9:16).
 adjusted per clip.
 - **Audio per clip.** Volume can be changed, and fade-in / fade-out can \
 be applied. Overall loudness can be normalized.
+- **Background music.** Audio files (e.g. .mp3, .wav, .m4a) placed in the \
+project folder can be mixed in as background music. Reference them by their \
+exact filename. The available music files are listed in the provided context \
+under "Available Music Files".
 - **Transitions between two clips.** The supported transitions are: \
 hard cut, dissolve (cross-fade), fade-to-black, fade-to-white, \
 fade-to-gray, wipes (left, right, up, down), slides (left, right, up, \

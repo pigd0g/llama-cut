@@ -15,6 +15,12 @@ from .video_production import VideoProductionSettings
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mpg", ".mpeg", ".ts"}
 
+# Audio files in the working folder can be used as background music by the
+# editor (Stage 8) via mix_audio. They are NOT selectable as video sources in
+# Stage 1 — they are surfaced to the storyboard/editor via the context and
+# resolved by _resolve_clip from the working folder root.
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".aac", ".m4a", ".ogg", ".flac"}
+
 
 def _sanitize_stem(stem: str) -> str:
     """Make a filename-safe stem (no path separators or illegal chars)."""
