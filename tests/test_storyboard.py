@@ -10,7 +10,6 @@ import pytest
 from src.storyboard import (
     STORYBOARD_SYSTEM_PROMPT,
     REFINEMENT_INSTRUCTIONS,
-    STORYBOARD_DIR,
     HISTORY_FILENAME,
     LATEST_FILENAME,
     EXPORT_FILENAME,
@@ -33,6 +32,7 @@ from src.storyboard import (
     save_history,
     save_latest_storyboard,
 )
+from src import paths
 from src.video_metadata import VideoMetadata
 
 
@@ -40,8 +40,8 @@ from src.video_metadata import VideoMetadata
 
 @pytest.fixture
 def tmp_working(tmp_path: Path) -> Path:
-    """A temporary working folder with a storyboard/ subdirectory."""
-    (tmp_path / STORYBOARD_DIR).mkdir()
+    """A temporary working folder with a .llama-cut/storyboard/ subdirectory."""
+    paths.storyboard_dir(str(tmp_path)).mkdir(parents=True, exist_ok=True)
     return tmp_path
 
 
@@ -402,7 +402,7 @@ def test_save_and_load_history(tmp_working: Path):
     h.add("brief", "# SB", "m", is_initial=True)
     save_history(str(tmp_working), h)
     # File should exist
-    assert (tmp_working / STORYBOARD_DIR / HISTORY_FILENAME).exists()
+    assert (paths.storyboard_dir(str(tmp_working)) / HISTORY_FILENAME).exists()
     # Load back
     h2 = load_history(str(tmp_working))
     assert len(h2.versions) == 1
@@ -416,14 +416,14 @@ def test_load_history_missing_file(tmp_path: Path):
 
 
 def test_load_history_corrupt_file(tmp_working: Path):
-    (tmp_working / STORYBOARD_DIR / HISTORY_FILENAME).write_text("not json", encoding="utf-8")
+    (paths.storyboard_dir(str(tmp_working)) / HISTORY_FILENAME).write_text("not json", encoding="utf-8")
     h = load_history(str(tmp_working))
     assert h.versions == []
 
 
 def test_save_and_load_latest_storyboard(tmp_working: Path):
     save_latest_storyboard(str(tmp_working), "# Storyboard\n\nContent")
-    assert (tmp_working / STORYBOARD_DIR / LATEST_FILENAME).exists()
+    assert (paths.storyboard_dir(str(tmp_working)) / LATEST_FILENAME).exists()
     loaded = load_latest_storyboard(str(tmp_working))
     assert loaded == "# Storyboard\n\nContent"
 
@@ -440,16 +440,16 @@ def test_export_storyboard(tmp_working: Path):
 
 
 def test_save_history_creates_dir(tmp_path: Path):
-    # No storyboard/ dir yet
+    # No .llama-cut/storyboard/ dir yet
     h = StoryboardHistory()
     h.add("b", "# SB", "m", True)
     save_history(str(tmp_path), h)
-    assert (tmp_path / STORYBOARD_DIR / HISTORY_FILENAME).exists()
+    assert (paths.storyboard_dir(str(tmp_path)) / HISTORY_FILENAME).exists()
 
 
 def test_save_latest_creates_dir(tmp_path: Path):
     save_latest_storyboard(str(tmp_path), "# SB")
-    assert (tmp_path / STORYBOARD_DIR / LATEST_FILENAME).exists()
+    assert (paths.storyboard_dir(str(tmp_path)) / LATEST_FILENAME).exists()
 
 
 # --- StoryboardSettings ----------------------------------------------------
@@ -484,7 +484,7 @@ def test_clear_storyboard_removes_all_artefacts(tmp_working: Path):
     save_history(str(tmp_working), h)
     save_latest_storyboard(str(tmp_working), "# Storyboard")
     export_storyboard(str(tmp_working), "# Exported")
-    sb_dir = tmp_working / STORYBOARD_DIR
+    sb_dir = paths.storyboard_dir(str(tmp_working))
     assert (sb_dir / HISTORY_FILENAME).exists()
     assert (sb_dir / LATEST_FILENAME).exists()
     assert (sb_dir / EXPORT_FILENAME).exists()
@@ -497,7 +497,7 @@ def test_clear_storyboard_removes_all_artefacts(tmp_working: Path):
 def test_clear_storyboard_no_dir(tmp_path: Path):
     # Should not raise if the storyboard directory doesn't exist
     clear_storyboard(str(tmp_path))
-    assert not (tmp_path / STORYBOARD_DIR).exists()
+    assert not paths.storyboard_dir(str(tmp_path)).exists()
 
 
 def test_clear_storyboard_load_returns_empty_after(tmp_working: Path):

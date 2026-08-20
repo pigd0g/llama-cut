@@ -7,10 +7,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 
+from . import paths
+
 
 # --- Storyboard directory / file names --------------------------------------
 
-STORYBOARD_DIR = "storyboard"
+# Leaf directory name (kept for tests that import the constant). The actual
+# path is resolved through ``paths.storyboard_dir()`` so it lands under
+# ``.llama-cut/``.
+STORYBOARD_DIR = paths.STORYBOARD_DIR_NAME
 HISTORY_FILENAME = "history.json"
 LATEST_FILENAME = "storyboard.md"
 EXPORT_FILENAME = "storyboard_export.md"
@@ -475,11 +480,11 @@ class StoryboardHistory:
 # --- Persistence ------------------------------------------------------------
 
 def _storyboard_dir(working_folder: str) -> Path:
-    return Path(working_folder) / STORYBOARD_DIR
+    return paths.storyboard_dir(working_folder)
 
 
 def load_history(working_folder: str) -> StoryboardHistory:
-    """Load storyboard history from ``<working_folder>/storyboard/history.json``.
+    """Load storyboard history from ``.llama-cut/storyboard/history.json``.
 
     Returns an empty StoryboardHistory if the file does not exist or is
     corrupt (never raises).
@@ -495,7 +500,7 @@ def load_history(working_folder: str) -> StoryboardHistory:
 
 
 def save_history(working_folder: str, history: StoryboardHistory) -> None:
-    """Persist storyboard history to ``<working_folder>/storyboard/history.json``."""
+    """Persist storyboard history to ``.llama-cut/storyboard/history.json``."""
     d = _storyboard_dir(working_folder)
     d.mkdir(parents=True, exist_ok=True)
     (d / HISTORY_FILENAME).write_text(
@@ -504,7 +509,7 @@ def save_history(working_folder: str, history: StoryboardHistory) -> None:
 
 
 def save_latest_storyboard(working_folder: str, storyboard: str) -> None:
-    """Write the latest storyboard markdown to ``<working_folder>/storyboard/storyboard.md``."""
+    """Write the latest storyboard markdown to ``.llama-cut/storyboard/storyboard.md``."""
     d = _storyboard_dir(working_folder)
     d.mkdir(parents=True, exist_ok=True)
     (d / LATEST_FILENAME).write_text(storyboard, encoding="utf-8")
@@ -522,7 +527,7 @@ def load_latest_storyboard(working_folder: str) -> str:
 
 
 def export_storyboard(working_folder: str, storyboard: str) -> Path:
-    """Write the storyboard to ``<working_folder>/storyboard/storyboard_export.md``.
+    """Write the storyboard to ``.llama-cut/storyboard/storyboard_export.md``.
 
     Returns the path to the written file.
     """
@@ -536,7 +541,7 @@ def export_storyboard(working_folder: str, storyboard: str) -> Path:
 def clear_storyboard(working_folder: str) -> None:
     """Delete all storyboard artefacts (history, latest, export).
 
-    Removes the entire ``<working_folder>/storyboard/`` directory so that
+    Removes the entire ``.llama-cut/storyboard/`` directory so that
     no iterations or previous storyboard artefacts are preserved. This is
     a clean-slate action. Does not raise if the directory does not exist.
     """

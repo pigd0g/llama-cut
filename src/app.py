@@ -33,7 +33,7 @@ from .pages.welcome_page import WelcomePage
 
 
 # Stage indices: 0=Welcome, 1=Select Videos, 2=Context, 3=Transcription,
-# 4=Frame Generation, 5=Select Frames, 6=Context Review, 7=Storyboard,
+# 4=Frame Extraction, 5=Frame Analysis, 6=Context Review, 7=Storyboard,
 # 8=Final Video
 NAV_ICONS = {
     0: "\ue8cc",  # folder
@@ -51,8 +51,8 @@ NAV_LABELS = {
     1: "1 · Select Videos",
     2: "2 · Context",
     3: "3 · Transcription",
-    4: "4 · Frame Generation",
-    5: "5 · Analyse Frames",
+    4: "4 · Frame Extraction",
+    5: "5 · Frame Analysis",
     6: "6 · Context Review",
     7: "7 · Storyboard",
     8: "8 · Final Video",

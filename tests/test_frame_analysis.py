@@ -131,7 +131,7 @@ def test_build_ollama_client_without_api_key_no_auth_header():
 
 def test_frame_analysis_settings_defaults():
     s = FrameAnalysisSettings()
-    assert s.concurrency == 1
+    assert s.concurrency == 3
 
 
 def test_frame_analysis_settings_roundtrip():

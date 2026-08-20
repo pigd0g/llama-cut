@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..context import ContextStore, ContextType
+from .. import paths
 from ..context_review import (
     build_export_markdown,
     load_assembled,
@@ -127,7 +128,7 @@ class ContextReviewPage(QWidget):
         """Called when navigating to this stage. Rebuilds the document."""
         if not self._state.working_folder:
             return
-        self._store = ContextStore(Path(self._state.working_folder) / "context")
+        self._store = ContextStore(paths.context_dir(self._state.working_folder))
         # Save any pending edits from a previous visit.
         self._flush_save()
         self._build_frame_paths()
@@ -460,7 +461,7 @@ class ContextReviewPage(QWidget):
 
     # --- Export ------------------------------------------------------------
     def _on_export(self) -> None:
-        """Export the assembled document to <working_folder>/video_context_report.md."""
+        """Export the assembled document to .llama-cut/video_context_report.md."""
         if self._store is None or not self._state.working_folder:
             return
         self._flush_save()
@@ -469,7 +470,7 @@ class ContextReviewPage(QWidget):
         # Rebuild frame paths in case frames changed.
         self._build_frame_paths()
         export_md = build_export_markdown(doc, self._frame_paths_by_filename)
-        out_path = Path(self._state.working_folder) / "video_context_report.md"
+        out_path = paths.context_report_path(self._state.working_folder)
         try:
             out_path.write_text(export_md, encoding="utf-8")
             self.status_label.setText(f"Exported to {out_path}")
@@ -527,8 +528,9 @@ class _AutoTextBrowser(QTextBrowser):
 class _AutoPlainEdit(QPlainTextEdit):
     """A QPlainTextEdit that sizes itself to its content and hides scrollbars.
 
-    The widget's height tracks the number of lines so the outer QScrollArea
-    is the only scrollbar the user sees.
+    The widget's height tracks the document's laid-out height (which accounts
+    for line wrapping) so the outer QScrollArea is the only scrollbar the user
+    sees.
     """
 
     def __init__(self, parent=None):
@@ -545,12 +547,18 @@ class _AutoPlainEdit(QPlainTextEdit):
     def _adjust_height(self, *_args) -> None:
         if self.width() <= 0:
             return
-        # Compute the height needed to show all lines without scrolling.
-        lines = max(self.blockCount(), 1)
-        line_height = int(self.fontMetrics().lineSpacing())
-        # 2x SPACING_MD padding (top + bottom) + a few px of slack.
-        height = lines * line_height + 2 * SPACING_MD + 8
-        self.setFixedHeight(max(height, 40))
+        # Use the document's laid-out height, which accounts for line
+        # wrapping (unlike blockCount() which only counts paragraphs).
+        content_width = self.width() - 2 * SPACING_MD - 4  # padding + border
+        if content_width > 0:
+            self.document().setTextWidth(content_width)
+        doc_height = int(self.document().size().height())
+        self.setFixedHeight(max(doc_height + 4, 40))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # Re-evaluate on width changes (text reflows).
+        self._adjust_height()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)

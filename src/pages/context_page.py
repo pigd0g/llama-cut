@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..context import ContextStore, ContextType
+from .. import paths
 from ..state import Video
 from ..theme import (
     COLOR_BORDER,
@@ -196,7 +197,7 @@ class ContextPage(QWidget):
         """Called when navigating to this stage. Rebuilds scope list."""
         if not self._state.working_folder:
             return
-        self._store = ContextStore(Path(self._state.working_folder) / "context")
+        self._store = ContextStore(paths.context_dir(self._state.working_folder))
         self._rebuild_scope_list()
         self._ensure_project_editor()
         # restore last selection or default to Project
@@ -279,7 +280,7 @@ class ContextPage(QWidget):
 
     def _on_continue(self) -> None:
         self._save_all_open_editors()
-        self._state.set_stage(3)  # Frame Generation
+        self._state.set_stage(3)  # Frame Extraction
 
     def _save_all_open_editors(self) -> None:
         if self._project_editor is not None:

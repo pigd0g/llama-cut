@@ -136,7 +136,7 @@ def build_ollama_client(config: OllamaConfig):
 
 @dataclass
 class FrameAnalysisSettings:
-    concurrency: int = 1
+    concurrency: int = 3
 
     def to_dict(self) -> dict:
         return asdict(self)

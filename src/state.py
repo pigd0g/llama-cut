@@ -7,6 +7,7 @@ from typing import Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from . import paths
 from .frame_analysis import FrameAnalysisSettings
 from .storyboard import StoryboardSettings
 from .transcription import TranscriptionSettings, model_cache_dir
@@ -141,10 +142,18 @@ class PipelineState(QObject):
         self.persist()
 
     @property
-    def temp_dir(self) -> Path:
+    def frames_dir(self) -> Path:
+        # All extracted frame images, frames.json, and .thumbs live under
+        # .llama-cut/frames/. This is the replacement for the old temp/ dir.
         if not self._working_folder:
             return Path()
-        return Path(self._working_folder) / "temp"
+        return paths.frames_dir(self._working_folder)
+
+    # Kept for backwards compatibility with older callers that read
+    # ``state.temp_dir``. New code should use ``frames_dir`` instead.
+    @property
+    def temp_dir(self) -> Path:
+        return self.frames_dir
 
     # --- Videos -------------------------------------------------------------
     @property
@@ -272,13 +281,13 @@ class PipelineState(QObject):
     # --- Persistence --------------------------------------------------------
     @property
     def _state_file(self) -> Path:
-        return self.temp_dir / "app_state.json"
+        return paths.app_state_path(self._working_folder)
 
     def persist(self) -> None:
         if not self._working_folder:
             return
         try:
-            self.temp_dir.mkdir(parents=True, exist_ok=True)
+            paths.app_root(self._working_folder).mkdir(parents=True, exist_ok=True)
             data = {
                 "working_folder": self._working_folder,
                 "stage": self._stage,
@@ -299,7 +308,14 @@ class PipelineState(QObject):
             return
         f = self._state_file
         if not f.exists():
-            return
+            # Tolerant fallback: if a legacy temp/app_state.json exists, read it
+            # once so existing sessions aren't lost. Not a migration — the file
+            # is not moved; the next persist() writes to the new location.
+            legacy = Path(self._working_folder) / "temp" / "app_state.json"
+            if legacy.exists():
+                f = legacy
+            else:
+                return
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             self._stage = int(data.get("stage", 0))
@@ -329,9 +345,13 @@ class PipelineState(QObject):
             pass
 
     def load_frames_json(self) -> Optional[list[Frame]]:
-        f = self.temp_dir / "frames.json"
+        f = paths.frames_index_path(self._working_folder)
         if not f.exists():
-            return None
+            # Tolerant fallback to legacy temp/frames.json (no migration).
+            legacy = Path(self._working_folder) / "temp" / "frames.json"
+            if not legacy.exists():
+                return None
+            f = legacy
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             return [Frame.from_dict(d) for d in data.get("frames", [])]
@@ -342,8 +362,8 @@ class PipelineState(QObject):
         if not self._working_folder:
             return
         try:
-            self.temp_dir.mkdir(parents=True, exist_ok=True)
-            (self.temp_dir / "frames.json").write_text(
+            paths.frames_dir(self._working_folder).mkdir(parents=True, exist_ok=True)
+            paths.frames_index_path(self._working_folder).write_text(
                 json.dumps({"frames": [f.to_dict() for f in frames]}, indent=2),
                 encoding="utf-8",
             )

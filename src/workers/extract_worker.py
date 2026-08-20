@@ -20,11 +20,11 @@ class ExtractWorker(QThread):
     finished_all = pyqtSignal(bool)              # any_failed
 
     def __init__(self, videos: list[Video], settings: ExtractSettings,
-                 temp_dir: Path, parent=None):
+                 frames_dir: Path, parent=None):
         super().__init__(parent)
         self._videos = list(videos)
         self._settings = settings
-        self._temp_dir = temp_dir
+        self._frames_dir = frames_dir
         self._cancel = False
 
     def cancel(self) -> None:
@@ -47,7 +47,7 @@ class ExtractWorker(QThread):
             )
             self.log.emit(f"Strategy: {decision.label}")
 
-            out_dir = self._temp_dir / v.stem
+            out_dir = self._frames_dir / v.stem
             outcome = extract_frames(
                 video_path=v.path,
                 video_stem=v.stem,

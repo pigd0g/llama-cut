@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..context import ContextStore
+from .. import paths
 from ..theme import (
     COLOR_SUCCESS,
     COLOR_WARNING,
@@ -320,7 +321,7 @@ class TranscriptionPage(QWidget):
         if not self._state.working_folder:
             return
         self._context_store = ContextStore(
-            Path(self._state.working_folder) / "context"
+            paths.context_dir(self._state.working_folder)
         )
         # detect hardware accel once (cheap, cached)
         self._hwaccel = detect_hardware_accel()
@@ -394,13 +395,13 @@ class TranscriptionPage(QWidget):
         self._update_button_state()
 
     def _save_selected_paths(self) -> None:
-        paths: list[str] = []
+        selected: list[str] = []
         for row in range(self.model.rowCount()):
             idx = self.model.index(row, 0)
             if idx.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked:
-                paths.append(idx.data(Qt.ItemDataRole.UserRole + 1))
+                selected.append(idx.data(Qt.ItemDataRole.UserRole + 1))
         s = self._state.transcription_settings
-        s.selected_video_paths = paths
+        s.selected_video_paths = selected
         self._state.set_transcription_settings(s)
 
     def _update_count(self) -> None:
@@ -560,7 +561,8 @@ class TranscriptionPage(QWidget):
         self.back_btn.setEnabled(False)
         s = self._state.transcription_settings
         self._transcribe_worker = TranscriptionWorker(
-            videos, s, self._state.models_dir, self._state.temp_dir,
+            videos, s, self._state.models_dir,
+            paths.transcription_dir(self._state.working_folder),
             self._context_store, self,
         )
         self._transcribe_worker.progress.connect(self._on_progress)
@@ -587,7 +589,7 @@ class TranscriptionPage(QWidget):
         self._refresh_model_status()
         if not any_failed:
             self.progress_label.setText("Transcription complete.")
-            # auto-advance to Frame Generation (stage 4)
+            # auto-advance to Frame Extraction (stage 4)
             self._state.set_stage(4)
         else:
             self.progress_label.setText("Completed with errors.")
@@ -595,7 +597,7 @@ class TranscriptionPage(QWidget):
     # --- Navigation --------------------------------------------------------
     def _on_skip(self) -> None:
         self._persist_settings()
-        self._state.set_stage(4)  # Frame Generation
+        self._state.set_stage(4)  # Frame Extraction
 
 
 # --- Helpers ----------------------------------------------------------------

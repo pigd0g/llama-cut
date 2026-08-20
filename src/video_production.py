@@ -56,12 +56,17 @@ from typing import Any, Callable
 
 from pydantic import BaseModel, Field, ValidationError
 
+from . import paths
+
 
 # --- Constants ---------------------------------------------------------------
 
 MAX_AGENT_ROUND_TRIPS = 150
 
-VIDEO_DIR = "video"
+# Leaf directory name (kept for tests that import the constant). The actual
+# path is resolved through ``paths.video_dir()`` so it lands under
+# ``.llama-cut/``.
+VIDEO_DIR = paths.VIDEO_DIR_NAME
 CLIPS_SUBDIR = "clips"
 OUTPUT_SUBDIR = "output"
 PREVIEW_SUBDIR = "preview"
@@ -728,7 +733,7 @@ class ToolRegistry:
         metadatas: list,
     ) -> None:
         self._working_folder = Path(working_folder)
-        self._video_dir = self._working_folder / VIDEO_DIR
+        self._video_dir = paths.video_dir(self._working_folder)
         self._clips_dir = self._video_dir / CLIPS_SUBDIR
         self._output_dir = self._video_dir / OUTPUT_SUBDIR
         self._preview_dir = self._video_dir / PREVIEW_SUBDIR
@@ -1955,7 +1960,7 @@ class ToolRegistry:
         return issues
 
     def _persist_current_plan(self) -> None:
-        """Write self._current_plan to video/edit_plan.json."""
+        """Write self._current_plan to .llama-cut/video/edit_plan.json."""
         if self._current_plan is None:
             return
         try:
@@ -2267,11 +2272,11 @@ def build_refinement_prompt(feedback: str, edit_plan_json: str,
 # --- Persistence -------------------------------------------------------------
 
 def _video_dir(working_folder: str) -> Path:
-    return Path(working_folder) / VIDEO_DIR
+    return paths.video_dir(working_folder)
 
 
 def save_edit_plan(working_folder: str, plan: EditPlan) -> Path:
-    """Persist the edit plan to video/edit_plan.json."""
+    """Persist the edit plan to .llama-cut/video/edit_plan.json."""
     d = _video_dir(working_folder)
     d.mkdir(parents=True, exist_ok=True)
     p = d / EDIT_PLAN_FILENAME
@@ -2291,7 +2296,7 @@ def load_edit_plan(working_folder: str) -> EditPlan | None:
 
 
 def save_tool_log(working_folder: str, log: list[dict]) -> Path:
-    """Persist the tool execution log to video/tool_log.json."""
+    """Persist the tool execution log to .llama-cut/video/tool_log.json."""
     d = _video_dir(working_folder)
     d.mkdir(parents=True, exist_ok=True)
     p = d / TOOL_LOG_FILENAME
@@ -2313,7 +2318,7 @@ def load_tool_log(working_folder: str) -> list[dict]:
 def clear_production(working_folder: str) -> None:
     """Delete all video production artefacts.
 
-    Removes the entire <working_folder>/video/ directory.
+    Removes the entire <working_folder>/.llama-cut/video/ directory.
     Does not raise if the directory does not exist.
     """
     d = _video_dir(working_folder)

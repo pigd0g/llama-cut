@@ -11,7 +11,6 @@ from src.video_production import (
     EDITING_SYSTEM_PROMPT,
     REFINEMENT_INSTRUCTIONS,
     MAX_AGENT_ROUND_TRIPS,
-    VIDEO_DIR,
     EDIT_PLAN_FILENAME,
     TOOL_LOG_FILENAME,
     SUPPORTED_TRANSITIONS,
@@ -40,6 +39,7 @@ from src.video_production import (
     _sanitize_name,
     _is_safe_output_path,
 )
+from src import paths
 
 
 # --- Fixtures ----------------------------------------------------------------
@@ -758,8 +758,8 @@ def test_load_tool_log_missing(tmp_working):
 
 
 def test_clear_production(tmp_working):
-    d = tmp_working / VIDEO_DIR
-    d.mkdir()
+    d = paths.video_dir(str(tmp_working))
+    d.mkdir(parents=True)
     (d / "edit_plan.json").write_text("{}")
     clear_production(str(tmp_working))
     assert not d.exists()

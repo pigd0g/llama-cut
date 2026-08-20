@@ -20,7 +20,7 @@ from ..transcription import (
 class TranscriptionWorker(QThread):
     """Run the two-phase transcription pipeline for the selected videos.
 
-    Phase 1: ffmpeg extracts audio to temp/<stem>.wav
+    Phase 1: ffmpeg extracts audio to .llama-cut/transcription/<stem>.wav
     Phase 2: faster_whisper transcribes the wav
     The WAV is deleted after each video's transcription completes, and the
     resulting markdown is written to the video's Transcription Context file.
@@ -32,13 +32,13 @@ class TranscriptionWorker(QThread):
     finished_all = pyqtSignal(bool)              # any_failed
 
     def __init__(self, videos: list[Video], settings: TranscriptionSettings,
-                 models_dir: Path, temp_dir: Path, context_store: ContextStore,
-                 parent=None):
+                 models_dir: Path, transcription_dir: Path,
+                 context_store: ContextStore, parent=None):
         super().__init__(parent)
         self._videos = list(videos)
         self._settings = settings
         self._models_dir = models_dir
-        self._temp_dir = temp_dir
+        self._transcription_dir = transcription_dir
         self._context_store = context_store
         self._cancel = False
 
@@ -77,7 +77,8 @@ class TranscriptionWorker(QThread):
             self.video_started.emit(v.path)
             self.log.emit(f"=== {v.name} ===")
 
-            wav_path = self._temp_dir / f"{v.stem}.wav"
+            wav_path = self._transcription_dir / f"{v.stem}.wav"
+            self._transcription_dir.mkdir(parents=True, exist_ok=True)
             result = TranscriptionResult(video_path=v.path, video_stem=v.stem)
             try:
                 self.log.emit("Extracting audio...")

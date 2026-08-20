@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
@@ -18,6 +16,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..context import ContextStore
+from .. import paths
 from ..context_review import markdown_to_html
 from ..storyboard import (
     StoryboardSettings,
@@ -143,7 +142,7 @@ class StoryboardPage(QWidget):
         """Called when navigating to this stage."""
         if not self._state.working_folder:
             return
-        self._store = ContextStore(Path(self._state.working_folder) / "context")
+        self._store = ContextStore(paths.context_dir(self._state.working_folder))
         self._flush_save()
         self._history = load_history(self._state.working_folder)
         self._storyboard_md = load_latest_storyboard(self._state.working_folder)

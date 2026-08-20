@@ -7,7 +7,6 @@ call logging. The user can iterate with feedback to refine the edit.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
@@ -24,6 +23,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..context import ContextStore
+from .. import paths
 from ..context_review import markdown_to_html
 from ..storyboard import load_latest_storyboard
 from ..theme import (
@@ -132,7 +132,7 @@ class VideoProductionPage(QWidget):
         """Called when navigating to this stage."""
         if not self._state.working_folder:
             return
-        self._store = ContextStore(Path(self._state.working_folder) / "context")
+        self._store = ContextStore(paths.context_dir(self._state.working_folder))
         self._storyboard_md = load_latest_storyboard(self._state.working_folder)
         self._edit_plan = load_edit_plan(self._state.working_folder)
         self._tool_log = []

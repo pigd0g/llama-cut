@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .. import paths
 from ..state import VIDEO_EXTENSIONS, Video
 from ..theme import (
     SPACING_LG,
@@ -155,12 +156,12 @@ class SelectVideosPage(QWidget):
             self._thumb_worker.cancel()
             self._thumb_worker.quit()
             self._thumb_worker.wait(2000)
-        paths = [v.path for v in self._state.videos if not v.thumbnail_path]
-        if not paths:
+        pending = [v.path for v in self._state.videos if not v.thumbnail_path]
+        if not pending:
             self._refresh_thumbs_from_state()
             return
-        thumbs_dir = Path(self._state.temp_dir) / ".thumbs"
-        self._thumb_worker = ThumbnailWorker(paths, thumbs_dir, self)
+        thumbs_dir = paths.thumbs_dir(self._state.working_folder)
+        self._thumb_worker = ThumbnailWorker(pending, thumbs_dir, self)
         self._thumb_worker.thumb_ready.connect(self._on_thumb_ready)
         self._thumb_worker.finished_all.connect(self._on_thumbs_done)
         self._thumb_worker.start()

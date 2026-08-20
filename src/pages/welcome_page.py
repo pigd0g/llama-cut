@@ -54,8 +54,8 @@ class WelcomePage(QWidget):
 
         subtitle = QLabel(
             "Choose a folder containing the videos you want to process. "
-            "All extracted frames and metadata will be saved into a "
-            "temp/ subfolder inside it."
+            "All extracted frames and metadata will be saved into a hidden "
+            ".llama-cut/ subfolder inside it."
         )
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setWordWrap(True)

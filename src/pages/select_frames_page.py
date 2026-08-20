@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
 
 from ..context import ContextStore, ContextType
 from ..frame_analysis import FrameAnalysisSettings, is_config_valid
+from .. import paths
 from ..state import Frame
 from ..theme import SPACING_LG, SPACING_MD, SPACING_SM
 from ..workers.frame_analysis_worker import FrameAnalysisWorker
@@ -46,7 +47,7 @@ class SelectFramesPage(QWidget):
         root.setSpacing(SPACING_MD)
 
         header = QHBoxLayout()
-        title = QLabel("Analyse Frames")
+        title = QLabel("Frame Analysis")
         title.setProperty("class", "headline-md")
         header.addWidget(title)
         header.addStretch()
@@ -145,7 +146,7 @@ class SelectFramesPage(QWidget):
     # --- Lifecycle ----------------------------------------------------------
     def on_enter(self) -> None:
         self._context_store = ContextStore(
-            Path(self._state.working_folder) / "context"
+            paths.context_dir(self._state.working_folder)
         ) if self._state.working_folder else None
         self._populate_video_filter()
         self._populate()
@@ -254,14 +255,14 @@ class SelectFramesPage(QWidget):
                              if f.video_path == self._filter_video}
         else:
             frame_by_path = {f.path: f for f in self._state.frames}
-        paths: list[str] = []
+        selected_paths: list[str] = []
         for row in range(self.model.rowCount()):
             idx = self.model.index(row, 0)
             if idx.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked:
                 p = idx.data(Qt.ItemDataRole.UserRole + 1)
                 if p in frame_by_path:
-                    paths.append(p)
-        frames = [frame_by_path[p] for p in paths]
+                    selected_paths.append(p)
+        frames = [frame_by_path[p] for p in selected_paths]
         # Chronological order: by video_path first-seen, then pts_time.
         return sorted(frames, key=lambda f: (f.video_path, f.pts_time))
 

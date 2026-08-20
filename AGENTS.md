@@ -84,13 +84,13 @@ The navigation sidebar (`src/app.py`) drives stage switching via
 - Output: written into the per-video Transcription context slot
   (`<stem>_transcription.md`).
 
-### Stage 4 — Frame Generation (`src/pages/frame_generation_page.py`,
+### Stage 4 — Frame Extraction (`src/pages/frame_generation_page.py`,
 `src/ffmpeg/extract.py`, `src/workers/extract_worker.py`)
 - Extracts representative still frames at intervals from each video.
 - Output: frame image files under the working folder; tracked in
   `PipelineState.frames`.
 
-### Stage 5 — Analyse Frames (`src/pages/select_frames_page.py`,
+### Stage 5 — Frame Analysis (`src/pages/select_frames_page.py`,
 `src/frame_analysis.py`, `src/workers/frame_analysis_worker.py`)
 - Sends extracted frames to a vision model (`OLLAMA_VISION_MODEL`) and
   writes a description + timestamp per frame. Runs are appended under a

@@ -48,7 +48,7 @@ class FrameGenerationPage(QWidget):
         outer.setContentsMargins(SPACING_LG, SPACING_LG, SPACING_LG, SPACING_LG)
         outer.setSpacing(SPACING_MD)
 
-        title = QLabel("Frame Generation")
+        title = QLabel("Frame Extraction")
         title.setProperty("class", "headline-md")
         outer.addWidget(title)
 
@@ -75,7 +75,7 @@ class FrameGenerationPage(QWidget):
         self.back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.back_btn.clicked.connect(lambda: self._state.set_stage(3))
         footer.addWidget(self.back_btn)
-        self.analyse_btn = QPushButton("Analyse")
+        self.analyse_btn = QPushButton("Extract")
         self.analyse_btn.setProperty("class", "primary")
         self.analyse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.analyse_btn.clicked.connect(self._on_analyse)
@@ -109,7 +109,7 @@ class FrameGenerationPage(QWidget):
         lay = QVBoxLayout(card)
         lay.setContentsMargins(SPACING_MD, SPACING_MD, SPACING_MD, SPACING_MD)
         lay.setSpacing(SPACING_SM)
-        hdr = QLabel("Frame Generation Setting")
+        hdr = QLabel("Frame Extraction Setting")
         hdr.setProperty("class", "headline-sm")
         lay.addWidget(hdr)
 
@@ -296,7 +296,7 @@ class FrameGenerationPage(QWidget):
         self.log_box.clear()
         self.analyse_btn.setEnabled(False)
         self._extract_worker = ExtractWorker(
-            videos, self._state.settings, self._state.temp_dir, self,
+            videos, self._state.settings, self._state.frames_dir, self,
         )
         self._extract_worker.progress.connect(self._on_extract_progress)
         self._extract_worker.log.connect(self._on_extract_log)
