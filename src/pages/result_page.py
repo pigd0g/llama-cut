@@ -3,22 +3,26 @@
 Displays the final rendered video in a player with play/pause, seek, and
 volume controls, alongside the agent's markdown summary report. Auto-navigated
 to from Stage 8 only when a video was successfully rendered.
+
+Uses the shared :class:`VideoPlayerWidget` from :mod:`video_preview` (the same
+player used for thumbnail previews elsewhere in the app) so the transport
+controls and player cleanup discipline are consistent.
+
+A "View Preview" button opens the video in a modal :class:`VideoPreviewDialog`
+for a focused full-screen viewing experience. The final video report fills
+the work area below the player.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QUrl
-from PyQt6.QtGui import QPixmap
-from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
-from PyQt6.QtMultimediaWidgets import QVideoWidget
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QScrollArea,
-    QSlider,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -30,9 +34,7 @@ from ..icons import material_icon
 from ..theme import (
     COLOR_BORDER,
     COLOR_ON_SURFACE_VARIANT,
-    COLOR_PRIMARY,
     COLOR_SURFACE,
-    COLOR_SURFACE_CONTAINER,
     RADIUS_LG,
     SPACING_LG,
     SPACING_MD,
@@ -40,7 +42,7 @@ from ..theme import (
 )
 from ..video_production import find_rendered_video, load_edit_plan
 from .context_review_page import _AutoTextBrowser
-from .video_preview import _format_time
+from .video_preview import VideoPlayerWidget, VideoPreviewDialog
 
 
 class ResultPage(QWidget):
@@ -50,8 +52,6 @@ class ResultPage(QWidget):
         super().__init__(parent)
         self._state = state
         self._video_path: Path | None = None
-        self._player: QMediaPlayer | None = None
-        self._audio_output: QAudioOutput | None = None
         self._build()
 
     # --- UI ----------------------------------------------------------------
@@ -102,14 +102,12 @@ class ResultPage(QWidget):
         wf = self._state.working_folder
         if not wf:
             return
-        # Prefer the edit plan's output_path (set by the worker post-render).
         plan = load_edit_plan(wf)
         if plan is not None and plan.output_path:
             p = Path(plan.output_path)
             if p.exists() and p.suffix.lower() == ".mp4":
                 self._video_path = p
                 return
-        # Fall back to scanning the output directory for the newest render.
         found = find_rendered_video(wf)
         if found is not None:
             self._video_path = found
@@ -117,7 +115,6 @@ class ResultPage(QWidget):
     # --- Content building --------------------------------------------------
     def _build_content(self) -> None:
         """Clear and rebuild the scrolling content."""
-        # Stop any existing player before rebuilding.
         self._stop_player()
 
         self.report_browser: QTextBrowser | None = None
@@ -134,9 +131,8 @@ class ResultPage(QWidget):
             self.status_label.setText("")
             return
 
-        self._content_layout.addWidget(self._build_player_card())
-        self._content_layout.addWidget(self._build_report_card())
-        self._content_layout.addStretch()
+        self._content_layout.addWidget(self._build_player_card(), 1)
+        self._content_layout.addWidget(self._build_report_card(), 1)
         self.status_label.setText(self._video_path.name)
 
     def _build_empty_state(self) -> QWidget:
@@ -163,78 +159,34 @@ class ResultPage(QWidget):
         return card
 
     def _build_player_card(self) -> QWidget:
+        """Build the video player card using the shared VideoPlayerWidget."""
         card = QFrame()
         card.setProperty("class", "card")
         lay = QVBoxLayout(card)
         lay.setContentsMargins(SPACING_MD, SPACING_MD, SPACING_MD, SPACING_MD)
         lay.setSpacing(SPACING_SM)
 
+        # Header row with title + View Preview button
+        hdr = QHBoxLayout()
         title = QLabel("Final Video")
         title.setProperty("class", "headline-sm")
-        lay.addWidget(title)
+        hdr.addWidget(title)
+        hdr.addStretch()
+        self.preview_btn = QPushButton("View Preview")
+        self.preview_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.preview_btn.clicked.connect(self._on_view_preview)
+        hdr.addWidget(self.preview_btn)
+        lay.addLayout(hdr)
 
-        # --- Video surface ---
-        self._video_widget = QVideoWidget()
-        self._video_widget.setStyleSheet(
-            f"background-color: #000000; "
-            f"border: 1px solid {COLOR_BORDER}; "
-            f"border-radius: {RADIUS_LG}px;"
-        )
-        self._video_widget.setMinimumHeight(320)
-        lay.addWidget(self._video_widget, 1)
-
-        # --- Player + audio output ---
-        self._audio_output = QAudioOutput()
-        self._player = QMediaPlayer()
-        self._player.setAudioOutput(self._audio_output)
-        self._player.setVideoOutput(self._video_widget)
-        self._player.setSource(QUrl.fromLocalFile(str(self._video_path)))
-        # Default volume to 100%.
-        self._audio_output.setVolume(1.0)
-
-        # --- Controls row ---
-        controls = QHBoxLayout()
-        controls.setSpacing(SPACING_SM)
-
-        self.play_btn = QPushButton("Play")
-        self.play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.play_btn.setFixedWidth(80)
-        self.play_btn.clicked.connect(self._on_play_pause)
-        controls.addWidget(self.play_btn)
-
-        self.seek_slider = QSlider(Qt.Orientation.Horizontal)
-        self.seek_slider.setRange(0, 0)
-        self.seek_slider.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.seek_slider.sliderMoved.connect(self._on_seek)
-        controls.addWidget(self.seek_slider, 1)
-
-        self.time_label = QLabel("0:00 / 0:00")
-        self.time_label.setProperty("class", "label-sm")
-        self.time_label.setStyleSheet(f"color: {COLOR_ON_SURFACE_VARIANT};")
-        self.time_label.setFixedWidth(96)
-        self.time_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        controls.addWidget(self.time_label)
-
-        # Volume control
-        vol_icon = material_icon("volume_up", 18, COLOR_ON_SURFACE_VARIANT)
-        controls.addWidget(vol_icon)
-        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
-        self.volume_slider.setRange(0, 100)
-        self.volume_slider.setValue(100)
-        self.volume_slider.setFixedWidth(96)
-        self.volume_slider.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.volume_slider.valueChanged.connect(self._on_volume_changed)
-        controls.addWidget(self.volume_slider)
-
-        lay.addLayout(controls)
-
-        # --- Wire player signals ---
-        self._player.positionChanged.connect(self._on_position_changed)
-        self._player.durationChanged.connect(self._on_duration_changed)
+        # Shared player widget (play/pause, seek, volume, timecode)
+        self._player_widget = VideoPlayerWidget(self)
+        self._player_widget.set_video_path(self._video_path)
+        lay.addWidget(self._player_widget, 1)
 
         return card
 
     def _build_report_card(self) -> QWidget:
+        """Build the large report card that fills the remaining work area."""
         card = QFrame()
         card.setProperty("class", "card")
         lay = QVBoxLayout(card)
@@ -267,48 +219,23 @@ class ResultPage(QWidget):
             f"padding: {SPACING_MD}px; }}"
         )
         self.report_browser.setHtml(html)
-        lay.addWidget(self.report_browser)
+        lay.addWidget(self.report_browser, 1)
         return card
 
+    # --- Preview dialog ----------------------------------------------------
+    def _on_view_preview(self) -> None:
+        """Open the video in a modal preview dialog for focused viewing."""
+        if self._video_path is None or not self._video_path.exists():
+            return
+        dlg = VideoPreviewDialog(self._video_path, title="Final Video Preview", parent=self)
+        dlg.exec()
+
     # --- Player controls ---------------------------------------------------
-    def _on_play_pause(self) -> None:
-        if self._player is None:
-            return
-        if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self._player.pause()
-            self.play_btn.setText("Play")
-        else:
-            self._player.play()
-            self.play_btn.setText("Pause")
-
-    def _on_position_changed(self, position: int) -> None:
-        if self.seek_slider is None:
-            return
-        # Avoid feedback loop: only update the slider if the user isn't
-        # currently dragging it.
-        if not self.seek_slider.isSliderDown():
-            self.seek_slider.setValue(position)
-        duration = self._player.duration() if self._player else 0
-        self.time_label.setText(f"{_format_time(position)} / {_format_time(duration)}")
-
-    def _on_duration_changed(self, duration: int) -> None:
-        if self.seek_slider is not None:
-            self.seek_slider.setRange(0, duration)
-
-    def _on_seek(self, position: int) -> None:
-        if self._player is not None:
-            self._player.setPosition(position)
-
-    def _on_volume_changed(self, value: int) -> None:
-        if self._audio_output is not None:
-            self._audio_output.setVolume(value / 100.0)
-
     def _stop_player(self) -> None:
         """Stop and release the current player before rebuilding content."""
-        if self._player is not None:
-            self._player.stop()
-            self._player = None
-        self._audio_output = None
+        if hasattr(self, "_player_widget") and self._player_widget is not None:
+            self._player_widget.cleanup()
+            self._player_widget = None
 
     # --- Cleanup -----------------------------------------------------------
     def __del__(self):

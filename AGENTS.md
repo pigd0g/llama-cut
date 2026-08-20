@@ -118,14 +118,51 @@ The navigation sidebar (`src/app.py`) drives stage switching via
 - Output: `storyboard/storyboard.md` + `storyboard/history.json`.
 
 ### Stage 8 — Final Video Production (`src/pages/video_production_page.py`,
-`src/video_production.py`, `src/workers/video_production_worker.py`)
-- Agentic, two-phase LLM editor (plan-then-execute) renders the final video
-  from the storyboard. See the "Stage 8 — Final Video Production" section
-  below for the full philosophy, tool set, and deferred optimisations.
+`src/video_production.py`, `src/edit_plan_executor.py`,
+`src/workers/chat_agent_worker.py`, `src/workers/edit_executor_worker.py`,
+`src/pages/chat_widget.py`, `src/pages/edit_plan_widget.py`,
+`src/pages/debug_plan_dialog.py`)
+- **Chat-driven edit plan builder.** The user converses with an LLM agent
+  (`OLLAMA_WORKFLOW_MODEL`) via a chat UI (`ChatWidget`) to build an edit
+  plan from the storyboard. The agent has 4 planning-only tools
+  (`probe_video`, `inspect_clip`, `commit_edit_plan`, `update_edit_plan`)
+  and never runs ffmpeg. The storyboard is injected as context (not shown
+  on this screen); `assets/ffmpeg-skill.md` is also injected so the agent
+  can construct correct command arguments.
+- **Chat UX:** deep charcoal background, user messages as right-aligned
+  pills, assistant messages left-aligned with bold sender label, a
+  pulsing-dots "Thinking…" animation while waiting for the LLM, and
+  expandable tool-call chips showing args/result/duration.
+- **Edit plan = beats + commands.** The `EditPlan` model has a `timeline`
+  (beats for visual display) and a `commands` list (typed ffmpeg ops for
+  execution), linked by `beat_id`. Each command type (`extract_clip`,
+  `create_transition`, `create_edit`, `assemble_timeline`, `mix_audio`,
+  `render_video`, `validate`) has a builder that renders the actual ffmpeg
+  command line.
+- **LEP (Linear Edit Plan) visual.** The plan is displayed as a
+  horizontal beat strip (`EditPlanWidget`) below the chat: each beat is a
+  vertical stack (annotation → 16:9 thumbnail → transition pill), with
+  status-colored borders. Thumbnails are extracted on-the-fly at each
+  beat's midpoint and cached. Amendments (reorder, insert, delete,
+  transition change) go through the chat → `update_edit_plan` → re-render.
+- **Debug modal.** A "Debug" button opens a modal (`DebugPlanDialog`)
+  showing the raw edit plan JSON and the queued ffmpeg commands as
+  copyable command-line strings.
+- **Execution.** The user clicks "Run Edit Plan" → confirmation dialog →
+  `EditExecutorWorker` runs the commands sequentially via
+  `EditPlanExecutor` with duration-weighted progress (Extract 20%,
+  Transitions 10%, Assemble 15%, Audio 5%, Render 40%, Validate 10%) and
+  safe abort (kill current subprocess). Completed clips are checkpoints
+  and are skipped on re-run.
+- **Failure → LLM feedback loop.** On a command failure, execution halts,
+  the failed command + ffmpeg stderr are injected into the chat as a
+  tool-role message, and the agent proposes a fix via `update_edit_plan`.
+  The user reviews the fix and re-runs (checkpoints are reused).
 - On a successful render, auto-navigates to Stage 9 (Result).
-- Output: `video/clips/*.mp4` (intermediate clips, kept as checkpoints),
-  `video/edit_plan.json`, `video/tool_log.json`, and the rendered video in
-  `video/output/` (final) or `video/preview/` (preview preset).
+- Output: `video/chat.json` (chat transcript), `video/edit_plan.json`,
+  `video/tool_log.json`, `video/thumbs/*.jpg` (beat thumbnails),
+  `video/clips/*.mp4` (intermediate clips, kept as checkpoints),
+  and the rendered video in `video/output/`.
 
 ### Stage 9 — Result (`src/pages/result_page.py`)
 - Displays the final rendered video in a player with play/pause, seek,
@@ -138,11 +175,12 @@ The navigation sidebar (`src/app.py`) drives stage switching via
   populates `edit_plan.output_path` post-render for a direct reference.
 - Output: read-only view of the rendered video + report; no files written.
 
-## Stage 8 — Final Video Production (V1 philosophy)
+## Stage 8 — Final Video Production (V2 philosophy)
 
-The editor is an **agentic, two-phase** LLM pipeline (plan-then-execute) with
-the goal: **accurate → deterministic → inspectable → recoverable**. The agent
-is a *careful* editor, not a fast editor.
+The editor is a **chat-driven, human-in-the-loop** LLM pipeline with the
+goal: **accurate → deterministic → inspectable → recoverable**. The agent
+is a *careful planner*, not an autonomous executor. The human reviews the
+plan before execution.
 
 Priority order (enforced in `EDITING_SYSTEM_PROMPT`):
 1. Correctly interpret the storyboard
@@ -150,17 +188,24 @@ Priority order (enforced in `EDITING_SYSTEM_PROMPT`):
 3. Respect exact timestamps
 4. Produce the intended sequence
 5. Apply transitions/effects correctly
-6. Verify the resulting video
-7. Only then optimise rendering performance
+6. Construct correct ffmpeg commands
+7. Only then optimise
 
 ### How it works
-- **Phase 1 — Plan:** the agent calls `probe_video` / `inspect_clip`, then
-  `commit_edit_plan` with a structured `EditPlan`. The plan is the source of
-  truth and is persisted to `video/edit_plan.json`. It can be amended with
-  `update_edit_plan`.
-- **Phase 2 — Execute:** the full tool set is available. Clip ids in the plan
-  become `output_name`s in `extract_clip` calls, so every clip is traceable to
-  its plan entry. Each clip is validated with `validate_clip`.
+- **Chat phase:** the agent converses with the user via `ChatWidget` to
+  build the edit plan. It has 4 planning-only tools: `probe_video`,
+  `inspect_clip`, `commit_edit_plan`, `update_edit_plan`. It never runs
+  ffmpeg. The storyboard + context + `assets/ffmpeg-skill.md` are injected
+  as the first hidden user message.
+- **Review phase:** the plan is displayed as a LEP horizontal beat strip
+  (`EditPlanWidget`) below the chat. The user amends via chat or approves.
+- **Execution phase:** `EditExecutorWorker` runs the queued commands
+  sequentially via `EditPlanExecutor` with duration-weighted progress and
+  safe abort. Completed clips are checkpoints (skipped on re-run).
+- **Failure → feedback loop:** on a command failure, execution halts, the
+  failed command + ffmpeg stderr are injected into the chat, and the agent
+  proposes a fix via `update_edit_plan`. The user re-runs with checkpoint
+  reuse.
 
 ### Storyboard ↔ editor coupling
 - `src/editor_capabilities.py` is the single source of truth describing the
@@ -168,7 +213,7 @@ Priority order (enforced in `EDITING_SYSTEM_PROMPT`):
   into the storyboard builder's prompts so the storyboard stays practical — but
   the storyboard itself must always be plain English and never reference tools.
 
-### Deferred optimisations (do NOT implement in V1)
+### Deferred optimisations (do NOT implement in V2)
 Proxy / draft-resolution workflows, aggressive intermediate caching,
 single-pass filter graphs, render optimisation beyond preset selection, GPU /
 NVENC tuning beyond the automatic fallback, parallel rendering, and

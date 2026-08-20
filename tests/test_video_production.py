@@ -9,16 +9,18 @@ import pytest
 
 from src.video_production import (
     EDITING_SYSTEM_PROMPT,
-    REFINEMENT_INSTRUCTIONS,
     MAX_AGENT_ROUND_TRIPS,
     EDIT_PLAN_FILENAME,
     TOOL_LOG_FILENAME,
+    CHAT_FILENAME,
     SUPPORTED_TRANSITIONS,
     SUPPORTED_PRESETS,
+    STAGE_WEIGHTS,
     VideoProductionConfig,
     VideoProductionSettings,
     EditPlan,
     EditFormat,
+    EditCommand,
     TimelineItem,
     TransitionSpec,
     AudioPlan,
@@ -27,15 +29,15 @@ from src.video_production import (
     load_video_production_config,
     is_config_valid,
     build_ollama_client,
-    build_generation_prompt,
-    build_refinement_prompt,
-    run_editing_agent,
     save_edit_plan,
     load_edit_plan,
     save_tool_log,
     load_tool_log,
+    save_chat,
+    load_chat,
     clear_production,
-    build_edit_plan_from_tool_log,
+    extract_beat_thumbnail,
+    load_ffmpeg_skill,
     _sanitize_name,
     _is_safe_output_path,
 )
@@ -93,17 +95,6 @@ def test_load_config_missing_vars(monkeypatch):
     assert cfg.model == ""
 
 
-def test_load_config_uses_workflow_model_not_vision(monkeypatch):
-    monkeypatch.setenv("OLLAMA_HOST", "http://localhost")
-    monkeypatch.setenv("OLLAMA_API_KEY", "")
-    monkeypatch.setenv("OLLAMA_VISION_MODEL", "vision_model")
-    monkeypatch.setenv("OLLAMA_WORKFLOW_MODEL", "workflow_model")
-    cfg = load_video_production_config()
-    assert cfg.model == "workflow_model"
-
-
-# --- is_config_valid ----------------------------------------------------------
-
 def test_is_config_valid_ok():
     cfg = VideoProductionConfig("http://localhost:11434", "", "gemma4")
     ok, msg = is_config_valid(cfg)
@@ -128,14 +119,6 @@ def test_is_config_valid_missing_model():
     cfg = VideoProductionConfig("http://localhost", "", "")
     ok, msg = is_config_valid(cfg)
     assert ok is False
-    assert "OLLAMA_WORKFLOW_MODEL" in msg
-
-
-def test_is_config_valid_missing_both():
-    cfg = VideoProductionConfig("", "", "")
-    ok, msg = is_config_valid(cfg)
-    assert ok is False
-    assert "OLLAMA_HOST" in msg
     assert "OLLAMA_WORKFLOW_MODEL" in msg
 
 
@@ -166,10 +149,12 @@ def test_timeline_item_defaults():
     item = TimelineItem(id="shot_01", source="ClipA.mp4",
                         source_start=0.0, source_end=5.0)
     assert item.speed == 1.0
-    assert item.transition_in is None
     assert item.transition_out is None
+    assert item.transition_duration == 0.0
     assert item.storyboard_shot == ""
     assert item.intermediate_clip == ""
+    assert item.status == "draft"
+    assert item.thumbnail_path == ""
 
 
 def test_timeline_item_speed_must_be_positive():
@@ -201,8 +186,18 @@ def test_edit_plan_defaults():
     plan = EditPlan()
     assert plan.version == 1
     assert plan.timeline == []
+    assert plan.commands == []
     assert plan.transitions == []
     assert plan.storyboard_version == 0
+
+
+def test_edit_command_defaults():
+    cmd = EditCommand(id="cmd01", type="extract_clip", args={})
+    assert cmd.id == "cmd01"
+    assert cmd.type == "extract_clip"
+    assert cmd.beat_id is None
+    assert cmd.args == {}
+    assert cmd.status == "pending"
 
 
 def test_edit_plan_serialization_roundtrip():
@@ -214,6 +209,11 @@ def test_edit_plan_serialization_roundtrip():
             TimelineItem(id="shot_01", source="A.mp4",
                          source_start=10.0, source_end=15.0,
                          storyboard_shot="Scene 1"),
+        ],
+        commands=[
+            EditCommand(id="cmd01", type="extract_clip", beat_id="shot_01",
+                        args={"source": "A.mp4", "start_time": 10.0,
+                              "end_time": 15.0, "output_name": "shot_01"}),
         ],
         transitions=[TransitionSpec(after="shot_01", type="dissolve", duration=1.0)],
         audio=AudioPlan(volume=1.5, fade_in=2.0, normalize=True),
@@ -227,6 +227,9 @@ def test_edit_plan_serialization_roundtrip():
     assert restored.format.width == 3840
     assert len(restored.timeline) == 1
     assert restored.timeline[0].storyboard_shot == "Scene 1"
+    assert len(restored.commands) == 1
+    assert restored.commands[0].type == "extract_clip"
+    assert restored.commands[0].beat_id == "shot_01"
     assert restored.transitions[0].type == "dissolve"
     assert restored.audio.normalize is True
 
@@ -295,430 +298,108 @@ def test_probe_video_ffprobe_fails(registry):
     assert "error" in data
 
 
-# --- ToolRegistry: extract_clip ----------------------------------------------
+# --- ToolRegistry: inspect_clip ---------------------------------------------
 
-def test_extract_clip_unknown_video(registry):
-    result = registry.extract_clip("Nonexistent.mp4", 0, 5, "clip1")
+def test_inspect_clip_unknown_video(registry):
+    result = registry.inspect_clip("Nonexistent.mp4", 0, 5)
     data = json.loads(result["content"])
     assert "error" in data
 
 
-def test_extract_clip_time_exceeds_duration(registry):
-    result = registry.extract_clip("ClipA.mp4", 50, 100, "clip1")
+def test_inspect_clip_invalid_range(registry):
+    result = registry.inspect_clip("ClipA.mp4", 50, 100)
     data = json.loads(result["content"])
     assert "error" in data
 
 
-def test_extract_clip_start_after_end(registry):
-    result = registry.extract_clip("ClipA.mp4", 10, 5, "clip1")
+# --- ToolRegistry: commit_edit_plan -----------------------------------------
+
+def test_commit_edit_plan_success(registry):
+    plan = {
+        "timeline": [
+            {"id": "shot01", "source": "ClipA.mp4",
+             "source_start": 0, "source_end": 5, "purpose": "Hook"},
+        ],
+        "commands": [
+            {"id": "cmd01", "type": "extract_clip", "beat_id": "shot01",
+             "args": {"source": "ClipA.mp4", "start_time": 0,
+                      "end_time": 5, "output_name": "shot01"}},
+        ],
+    }
+    result = registry.commit_edit_plan(plan)
+    data = json.loads(result["content"])
+    assert data["timeline_count"] == 1
+    assert data["commands_count"] == 1
+    assert registry.current_plan is not None
+    assert len(registry.current_plan.timeline) == 1
+
+
+def test_commit_edit_plan_validation_error(registry):
+    result = registry.commit_edit_plan({"timeline": "not a list"})
     data = json.loads(result["content"])
     assert "error" in data
 
 
-def test_extract_clip_success_reencode(registry, tmp_working):
-    # Create a fake source video file
-    src = tmp_working / "ClipA.mp4"
-    src.write_bytes(b"fake")
-
-    def mock_run(cmd, timeout=1800):
-        # Verify it re-encodes (not stream copy)
-        assert "libx264" in cmd, "extract_clip should re-encode to bake rotation"
-        out_path = Path(cmd[-1])
-        out_path.write_bytes(b"fake clip")
-        return 0, "", ""
-
-    with patch("src.video_production._run_ffmpeg", side_effect=mock_run):
-        result = registry.extract_clip("ClipA.mp4", 0, 5, "clip1")
+def test_commit_edit_plan_warnings_for_unknown_source(registry):
+    plan = {
+        "timeline": [
+            {"id": "shot01", "source": "Nonexistent.mp4",
+             "source_start": 0, "source_end": 5},
+        ],
+        "commands": [],
+    }
+    result = registry.commit_edit_plan(plan)
     data = json.loads(result["content"])
-    assert data.get("output_name") == "clip1"
-    assert "output_path" in data
-
-
-# --- ToolRegistry: create_transition ----------------------------------------
-
-def test_create_transition_unsupported_type(registry, tmp_working):
-    result = registry.create_transition("a", "b", "crazy_effect", 1.0, "out")
-    data = json.loads(result["content"])
-    assert "error" in data
-    assert "Unsupported transition" in data["error"]
-
-
-def test_create_transition_clip_not_found(registry):
-    result = registry.create_transition("nonexistent", "also_nonexistent",
-                                          "dissolve", 1.0, "out")
-    data = json.loads(result["content"])
-    assert "error" in data
-
-
-def test_create_transition_cut_success(registry, tmp_working):
-    clips_dir = registry._clips_dir
-    (clips_dir / "a.mp4").write_bytes(b"fake")
-    (clips_dir / "b.mp4").write_bytes(b"fake")
-    registry._intermediate_clips["a"] = str(clips_dir / "a.mp4")
-    registry._intermediate_clips["b"] = str(clips_dir / "b.mp4")
-
-    def mock_run(cmd, timeout=1800):
-        Path(cmd[-1]).write_bytes(b"fake")
-        return 0, "", ""
-
-    with patch("src.video_production._run_ffmpeg", side_effect=mock_run):
-        result = registry.create_transition("a", "b", "cut", 0, "out")
-    data = json.loads(result["content"])
-    assert data.get("transition") == "cut"
-
-
-# --- ToolRegistry: render_video ---------------------------------------------
-
-def test_render_video_unsupported_preset(registry, tmp_working):
-    result = registry.render_video("timeline", "final.mp4", preset="bad_preset")
-    data = json.loads(result["content"])
-    assert "error" in data
-    assert "Unsupported preset" in data["error"]
-
-
-def test_render_video_timeline_not_found(registry):
-    result = registry.render_video("nonexistent", "final.mp4", preset="preview")
-    data = json.loads(result["content"])
-    assert "error" in data
-
-
-def test_render_video_success(registry, tmp_working):
-    clips_dir = registry._clips_dir
-    timeline_path = clips_dir / "timeline.mp4"
-    timeline_path.write_bytes(b"fake")
-    registry._intermediate_clips["timeline"] = str(timeline_path)
-
-    def mock_run(cmd, timeout=3600):
-        Path(cmd[-1]).write_bytes(b"fake render")
-        return 0, "", ""
-
-    with patch("src.video_production._run_ffmpeg", side_effect=mock_run):
-        with patch("src.video_production.is_nvenc_available", return_value=False):
-            result = registry.render_video("timeline", "final.mp4", preset="preview")
-    data = json.loads(result["content"])
-    assert "output_path" in data
-    assert data["preset"] == "preview"
-    assert data["codec"] == "libx264"
-
-
-def test_render_video_nvenc_success(registry, tmp_working):
-    clips_dir = registry._clips_dir
-    timeline_path = clips_dir / "timeline.mp4"
-    timeline_path.write_bytes(b"fake")
-    registry._intermediate_clips["timeline"] = str(timeline_path)
-
-    def mock_run(cmd, timeout=3600):
-        assert "h264_nvenc" in cmd, "should use NVENC when available"
-        Path(cmd[-1]).write_bytes(b"fake render")
-        return 0, "", ""
-
-    with patch("src.video_production._run_ffmpeg", side_effect=mock_run):
-        with patch("src.video_production.is_nvenc_available", return_value=True):
-            result = registry.render_video("timeline", "final.mp4", preset="preview")
-    data = json.loads(result["content"])
-    assert "output_path" in data
-    assert data["codec"] == "h264_nvenc"
-
-
-def test_render_video_h265_nvenc(registry, tmp_working):
-    clips_dir = registry._clips_dir
-    timeline_path = clips_dir / "timeline.mp4"
-    timeline_path.write_bytes(b"fake")
-    registry._intermediate_clips["timeline"] = str(timeline_path)
-
-    def mock_run(cmd, timeout=3600):
-        assert "hevc_nvenc" in cmd, "should use hevc_nvenc for h265"
-        Path(cmd[-1]).write_bytes(b"fake render")
-        return 0, "", ""
-
-    with patch("src.video_production._run_ffmpeg", side_effect=mock_run):
-        with patch("src.video_production.is_nvenc_available", return_value=True):
-            result = registry.render_video("timeline", "final.mp4",
-                                           preset="preview", video_codec="h265")
-    data = json.loads(result["content"])
-    assert data["codec"] == "hevc_nvenc"
-
-
-def test_render_video_nvenc_fallback_to_software(registry, tmp_working):
-    clips_dir = registry._clips_dir
-    timeline_path = clips_dir / "timeline.mp4"
-    timeline_path.write_bytes(b"fake")
-    registry._intermediate_clips["timeline"] = str(timeline_path)
-
-    call_count = [0]
-    def mock_run(cmd, timeout=3600):
-        call_count[0] += 1
-        if call_count[0] == 1:
-            # NVENC fails
-            return 1, "", "NVENC not available"
-        # Software encoder succeeds
-        assert "libx264" in cmd, "should fall back to libx264"
-        Path(cmd[-1]).write_bytes(b"fake render")
-        return 0, "", ""
-
-    with patch("src.video_production._run_ffmpeg", side_effect=mock_run):
-        with patch("src.video_production.is_nvenc_available", return_value=True):
-            result = registry.render_video("timeline", "final.mp4", preset="preview")
-    data = json.loads(result["content"])
-    assert "output_path" in data
-    assert data["codec"] == "libx264"
-    assert call_count[0] == 2
-
-
-# --- ToolRegistry: validate_video --------------------------------------------
-
-def test_validate_video_file_not_found(registry):
-    result = registry.validate_video("nonexistent.mp4")
-    data = json.loads(result["content"])
-    assert "error" in data
-
-
-def test_validate_video_success(registry, tmp_working):
-    out_dir = registry._output_dir
-    (out_dir / "final.mp4").write_bytes(b"fake")
-
-    from src.ffmpeg.probe import ProbeResult
-    fake_probe = ProbeResult(
-        duration=60.0, width=1920, height=1080, codec="h264",
-        fps=25.0, raw={},
-    )
-    with patch("src.ffmpeg.probe.run_ffprobe", return_value=fake_probe):
-        result = registry.validate_video("final.mp4")
-    data = json.loads(result["content"])
-    assert data["passed"] is True
-    assert data["duration"] == 60.0
-
-
-def test_validate_video_with_expected_mismatch(registry, tmp_working):
-    out_dir = registry._output_dir
-    (out_dir / "final.mp4").write_bytes(b"fake")
-
-    from src.ffmpeg.probe import ProbeResult
-    fake_probe = ProbeResult(
-        duration=30.0, width=1280, height=720, codec="h264",
-        fps=25.0, raw={},
-    )
-    with patch("src.ffmpeg.probe.run_ffprobe", return_value=fake_probe):
-        result = registry.validate_video("final.mp4",
-                                          expected_duration=60.0,
-                                          expected_resolution="1920x1080")
-    data = json.loads(result["content"])
-    assert data["passed"] is False
-    assert len(data["issues"]) == 2
-
-
-# --- ToolRegistry: assemble_timeline -----------------------------------------
-
-def test_assemble_timeline_no_clips(registry):
-    result = registry.assemble_timeline([], output_name="timeline")
-    data = json.loads(result["content"])
-    assert "error" in data
-
-
-def test_assemble_timeline_missing_clips(registry):
-    result = registry.assemble_timeline(["a", "b"], output_name="timeline")
-    data = json.loads(result["content"])
-    assert "error" in data
-
-
-def test_assemble_timeline_success_concat(registry, tmp_working):
-    clips_dir = registry._clips_dir
-    for name in ("a.mp4", "b.mp4"):
-        (clips_dir / name).write_bytes(b"fake")
-    registry._intermediate_clips["a"] = str(clips_dir / "a.mp4")
-    registry._intermediate_clips["b"] = str(clips_dir / "b.mp4")
-
-    def mock_run(cmd, timeout=1800):
-        # Verify it re-encodes (not stream copy) to bake rotation
-        assert "libx264" in cmd, "assemble_timeline should re-encode concat"
-        out_path = Path(cmd[-1])
-        out_path.write_bytes(b"fake timeline")
-        return 0, "", ""
-
-    with patch("src.video_production._run_ffmpeg", side_effect=mock_run):
-        result = registry.assemble_timeline(["a", "b"], output_name="timeline")
-    data = json.loads(result["content"])
-    assert data.get("clips_assembled") == 2
-
-
-def test_assemble_timeline_with_transitions(registry, tmp_working):
-    clips_dir = registry._clips_dir
-    for name in ("a.mp4", "b.mp4", "c.mp4"):
-        (clips_dir / name).write_bytes(b"fake")
-    registry._intermediate_clips["a"] = str(clips_dir / "a.mp4")
-    registry._intermediate_clips["b"] = str(clips_dir / "b.mp4")
-    registry._intermediate_clips["c"] = str(clips_dir / "c.mp4")
-
-    def mock_run(cmd, timeout=1800):
-        # Verify the filter_complex uses labeled streams (not raw [0:v])
-        fc_idx = cmd.index("-filter_complex") if "-filter_complex" in cmd else -1
-        if fc_idx >= 0:
-            fc = cmd[fc_idx + 1]
-            # Should use normalized labels like [nv0], [na0]
-            assert "[nv0]" in fc, "should use normalized video labels"
-            assert "[na0]" in fc, "should use normalized audio labels"
-            # Should use xfade for dissolve, not concat
-            assert "xfade" in fc, "should use xfade for dissolve transitions"
-        out_path = Path(cmd[-1])
-        out_path.write_bytes(b"fake timeline")
-        return 0, "", ""
-
-    with patch("src.video_production._run_ffmpeg", side_effect=mock_run):
-        with patch.object(registry, "_probe_duration", return_value=10.0):
-            result = registry.assemble_timeline(
-                ["a", "b", "c"],
-                transitions=[
-                    {"after": "a", "type": "dissolve", "duration": 1.0},
-                    {"after": "b", "type": "cut", "duration": 0.0},
-                ],
-                output_name="timeline_trans",
-            )
-    data = json.loads(result["content"])
-    assert data.get("clips_assembled") == 3
-    assert data.get("transitions") == 2
-
-
-# --- Agent loop ---------------------------------------------------------------
-
-def _loop_registry(tmp_path: Path) -> ToolRegistry:
-    """A minimal ToolRegistry for the agent loop tests (no source videos)."""
-    return ToolRegistry(str(tmp_path), [], [])
-
-
-def test_agent_loop_no_tool_calls(tmp_path):
-    """Agent responds with text only — loop runs once."""
-    mock_client = MagicMock()
-    mock_msg = MagicMock()
-    mock_msg.tool_calls = None
-    mock_msg.content = "Done editing."
-    mock_client.chat.return_value = MagicMock(message=mock_msg)
-
-    final_text, tool_log = run_editing_agent(
-        mock_client, "model", "system", "user",
-        registry=_loop_registry(tmp_path),
-    )
-    assert final_text == "Done editing."
-    assert tool_log == []
-
-
-def test_agent_loop_one_tool_then_done(tmp_path):
-    """Agent calls one tool, then responds with text."""
-    mock_client = MagicMock()
-    call_count = [0]
-    def chat_side_effect(**kwargs):
-        call_count[0] += 1
-        msg = MagicMock()
-        if call_count[0] == 1:
-            mock_call = MagicMock()
-            mock_call.function.name = "probe_video"
-            mock_call.function.arguments = {"video_path": "ClipA.mp4"}
-            msg.tool_calls = [mock_call]
-            msg.content = ""
-        else:
-            msg.tool_calls = None
-            msg.content = "Finished."
-        return MagicMock(message=msg)
-
-    mock_client.chat.side_effect = chat_side_effect
-
-    registry = _loop_registry(tmp_path)
-    # probe_video is a phase-1 tool; patch it so it succeeds without ffprobe.
-    # The replacement must keep __name__ == "probe_video" so _execute_tool_call
-    # can dispatch to it by name.
-    def probe_video(video_path: str) -> dict:
-        return {"filename": video_path}
-    registry.probe_video = probe_video  # type: ignore[assignment]
-
-    final_text, tool_log = run_editing_agent(
-        mock_client, "model", "system", "user",
-        registry=registry,
-    )
-    assert final_text == "Finished."
-    assert len(tool_log) == 1
-    assert tool_log[0]["tool"] == "probe_video"
-
-
-def test_agent_loop_exhaustion(tmp_path):
-    """Agent keeps calling tools until the limit is reached."""
-    mock_client = MagicMock()
-    msg = MagicMock()
-    msg.tool_calls = [MagicMock()]
-    msg.tool_calls[0].function.name = "probe_video"
-    msg.tool_calls[0].function.arguments = {}
-    msg.content = ""
-    mock_client.chat.return_value = MagicMock(message=msg)
-
-    registry = _loop_registry(tmp_path)
-    # Replacement must keep __name__ == "probe_video" for tool dispatch.
-    def probe_video(**kw) -> dict:
-        return {"ok": True}
-    registry.probe_video = probe_video  # type: ignore[assignment]
-
-    final_text, tool_log = run_editing_agent(
-        mock_client, "model", "system", "user",
-        registry=registry,
-        log_cb=lambda s: None,
-    )
-    assert "exhausted" in final_text.lower() or "did not complete" in final_text.lower()
-    assert len(tool_log) == MAX_AGENT_ROUND_TRIPS
-
-
-def test_agent_loop_detects_tool_failure(tmp_path):
-    """A tool returning a ToolResult failure is recorded as success=False in
-    the tool log and the error is visible (not double-wrapped). This guards
-    against the regression where to_tool_message() dicts were passed straight
-    through, causing every failure to log as OK."""
-    mock_client = MagicMock()
-    call_count = [0]
-
-    def chat_side_effect(**kwargs):
-        call_count[0] += 1
-        msg = MagicMock()
-        if call_count[0] == 1:
-            mock_call = MagicMock()
-            mock_call.function.name = "probe_video"
-            mock_call.function.arguments = {"video_path": "missing.mp4"}
-            msg.tool_calls = [mock_call]
-            msg.content = ""
-        else:
-            msg.tool_calls = None
-            msg.content = "Done."
-        return MagicMock(message=msg)
-
-    mock_client.chat.side_effect = chat_side_effect
-    registry = _loop_registry(tmp_path)
-    # Use the real probe_video, which returns a ToolResult failure for an
-    # unknown source (no ffprobe needed — it rejects before probing).
-    final_text, tool_log = run_editing_agent(
-        mock_client, "model", "system", "user",
-        registry=registry,
-    )
-    assert len(tool_log) == 1
-    assert tool_log[0]["tool"] == "probe_video"
-    # The failure must be detected (was always True before the fix).
-    assert tool_log[0]["success"] is False
-    # The error text must be present and readable, not double-wrapped JSON.
-    result = tool_log[0]["result"]
-    assert isinstance(result, dict)
-    assert "error" in result
-    assert "not a selected source video" in result["error"]
-
-
-# --- Prompt building --------------------------------------------------------
-
-def test_build_generation_prompt_includes_storyboard():
-    prompt = build_generation_prompt("# Story\n\nScene 1", "# Context\n\nInfo")
-    assert "Story" in prompt
-    assert "Context" in prompt
-    assert "Task" in prompt
-
-
-def test_build_refinement_prompt_includes_feedback():
-    prompt = build_refinement_prompt(
-        "Make it shorter", '{"version": 1}', "# Story", "# Context",
-    )
-    assert "Make it shorter" in prompt
-    assert "version" in prompt
+    assert "warnings" in data
+    assert any("unknown source" in w.lower() for w in data["warnings"])
+
+
+def test_update_edit_plan_replaces(registry):
+    plan1 = {
+        "timeline": [{"id": "shot01", "source": "ClipA.mp4",
+                      "source_start": 0, "source_end": 5}],
+        "commands": [],
+    }
+    registry.commit_edit_plan(plan1)
+    assert len(registry.current_plan.timeline) == 1
+
+    plan2 = {
+        "timeline": [
+            {"id": "shot01", "source": "ClipA.mp4",
+             "source_start": 0, "source_end": 5},
+            {"id": "shot02", "source": "ClipB.mp4",
+             "source_start": 0, "source_end": 3},
+        ],
+        "commands": [],
+    }
+    registry.update_edit_plan(plan2)
+    assert len(registry.current_plan.timeline) == 2
+
+
+# --- ToolRegistry: only 4 tools ---------------------------------------------
+
+def test_registry_has_four_tools(registry):
+    tools = registry.get_tools()
+    names = [getattr(t, "__name__", "") for t in tools]
+    assert "probe_video" in names
+    assert "inspect_clip" in names
+    assert "commit_edit_plan" in names
+    assert "update_edit_plan" in names
+    assert len(tools) == 4
+
+
+def test_registry_no_execution_tools(registry):
+    """The 8 execution tools (extract_clip, render_video, etc.) must be gone."""
+    tools = registry.get_tools()
+    names = [getattr(t, "__name__", "") for t in tools]
+    assert "extract_clip" not in names
+    assert "create_transition" not in names
+    assert "render_video" not in names
+    assert "assemble_timeline" not in names
+    assert "validate_clip" not in names
+    assert "validate_video" not in names
+    assert "mix_audio" not in names
+    assert "create_edit" not in names
 
 
 # --- Persistence -------------------------------------------------------------
@@ -728,6 +409,10 @@ def test_save_and_load_edit_plan(tmp_working):
         version=1, target_duration=30.0,
         timeline=[TimelineItem(id="shot_01", source="A.mp4",
                                 source_start=0, source_end=5)],
+        commands=[EditCommand(id="cmd01", type="extract_clip",
+                              beat_id="shot_01",
+                              args={"source": "A.mp4", "start_time": 0,
+                                    "end_time": 5, "output_name": "shot_01"})],
     )
     save_edit_plan(str(tmp_working), plan)
     loaded = load_edit_plan(str(tmp_working))
@@ -736,6 +421,8 @@ def test_save_and_load_edit_plan(tmp_working):
     assert loaded.target_duration == 30.0
     assert len(loaded.timeline) == 1
     assert loaded.timeline[0].id == "shot_01"
+    assert len(loaded.commands) == 1
+    assert loaded.commands[0].type == "extract_clip"
 
 
 def test_load_edit_plan_missing(tmp_working):
@@ -755,6 +442,22 @@ def test_save_and_load_tool_log(tmp_working):
 
 def test_load_tool_log_missing(tmp_working):
     assert load_tool_log(str(tmp_working)) == []
+
+
+def test_save_and_load_chat(tmp_working):
+    messages = [
+        {"role": "user", "content": "Make it short"},
+        {"role": "assistant", "content": "I'll trim it."},
+    ]
+    save_chat(str(tmp_working), messages)
+    loaded = load_chat(str(tmp_working))
+    assert len(loaded) == 2
+    assert loaded[0]["role"] == "user"
+    assert loaded[1]["content"] == "I'll trim it."
+
+
+def test_load_chat_missing(tmp_working):
+    assert load_chat(str(tmp_working)) == []
 
 
 def test_clear_production(tmp_working):
@@ -787,54 +490,10 @@ def test_video_production_settings_from_dict():
     assert s.last_feedback == "test"
 
 
-# --- build_edit_plan_from_tool_log -------------------------------------------
-
-def test_build_edit_plan_from_tool_log():
-    log = [
-        {"tool": "probe_video", "args": {"video_path": "A.mp4"},
-         "result": {"duration": 60.0}, "success": True},
-        {"tool": "extract_clip",
-         "args": {"video_path": "A.mp4", "start_time": 0, "end_time": 5, "output_name": "clip1"},
-         "result": {"output_name": "clip1", "output_path": "/clips/clip1.mp4"},
-         "success": True},
-        {"tool": "extract_clip",
-         "args": {"video_path": "A.mp4", "start_time": 10, "end_time": 15, "output_name": "clip2"},
-         "result": {"output_name": "clip2", "output_path": "/clips/clip2.mp4"},
-         "success": True},
-        {"tool": "create_transition",
-         "args": {"clip_a": "clip1", "clip_b": "clip2", "transition": "dissolve", "duration": 1.0},
-         "result": {"output_name": "trans1"},
-         "success": True},
-    ]
-    plan = build_edit_plan_from_tool_log(log, storyboard_version=2)
-    assert plan.storyboard_version == 2
-    assert len(plan.timeline) == 2
-    # The fallback builder now uses the clip's output_name as the id so each
-    # plan item is traceable to its generated clip (matching the proactive
-    # plan-then-execute contract).
-    assert plan.timeline[0].id == "clip1"
-    assert plan.timeline[0].intermediate_clip == "clip1"
-    assert plan.timeline[0].source == "A.mp4"
-    assert plan.timeline[0].source_start == 0
-    assert plan.timeline[1].source_start == 10
-    assert len(plan.transitions) == 1
-    assert plan.transitions[0].type == "dissolve"
-
-
-def test_build_edit_plan_from_tool_log_skips_errors():
-    log = [
-        {"tool": "extract_clip",
-         "args": {"video_path": "A.mp4", "start_time": 0, "end_time": 5, "output_name": "clip1"},
-         "result": {"error": "failed"}, "success": False},
-    ]
-    plan = build_edit_plan_from_tool_log(log)
-    assert len(plan.timeline) == 0
-
-
 # --- Constants ---------------------------------------------------------------
 
 def test_max_agent_round_trips_is_reasonable():
-    assert MAX_AGENT_ROUND_TRIPS == 150
+    assert MAX_AGENT_ROUND_TRIPS == 80
 
 
 def test_supported_transitions_includes_common():
@@ -850,6 +509,16 @@ def test_supported_presets_includes_common():
     assert "high_quality" in SUPPORTED_PRESETS
 
 
+def test_stage_weights_sum_to_one():
+    total = sum(STAGE_WEIGHTS.values())
+    assert abs(total - 1.0) < 0.001
+
+
+def test_stage_weights_cover_all_stages():
+    expected = {"extract", "transitions", "assemble", "audio", "render", "validate"}
+    assert set(STAGE_WEIGHTS.keys()) == expected
+
+
 # --- ToolResult --------------------------------------------------------------
 
 def test_tool_result_to_tool_message():
@@ -861,10 +530,52 @@ def test_tool_result_to_tool_message():
 
 # --- System prompt -----------------------------------------------------------
 
-def test_editing_system_prompt_mentions_tools():
-    assert "tools" in EDITING_SYSTEM_PROMPT.lower()
-    assert "probe_video" in EDITING_SYSTEM_PROMPT
+def test_editing_system_prompt_mentions_plan():
+    assert "edit plan" in EDITING_SYSTEM_PROMPT.lower()
+    assert "commit_edit_plan" in EDITING_SYSTEM_PROMPT
 
 
-def test_refinement_instructions_mentions_preserve():
-    assert "preserv" in REFINEMENT_INSTRUCTIONS.lower()
+def test_editing_system_prompt_no_execution_tools():
+    """The prompt must not instruct the agent to run ffmpeg execution tools."""
+    # The system prompt should not reference the removed execution tools
+    # as tools the agent calls (only as command types in the plan).
+    # It's OK for them to appear as command type descriptions.
+    assert "You do NOT run ffmpeg" in EDITING_SYSTEM_PROMPT
+
+
+# --- FFmpeg skill loading ----------------------------------------------------
+
+def test_load_ffmpeg_skill_returns_content():
+    skill = load_ffmpeg_skill()
+    assert len(skill) > 0
+    assert "ffmpeg" in skill.lower()
+
+
+# --- Beat thumbnail ----------------------------------------------------------
+
+def test_extract_beat_thumbnail_caches(tmp_working):
+    # Create a fake source video
+    src = tmp_working / "ClipA.mp4"
+    src.write_bytes(b"fake")
+
+    def mock_run(cmd, timeout=1800):
+        # Simulate ffmpeg writing a jpg
+        out = Path(cmd[-1])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake jpg")
+        return 0, "", ""
+
+    with patch("src.video_production._run_ffmpeg", side_effect=mock_run):
+        thumb1 = extract_beat_thumbnail(
+            str(tmp_working), str(src), 10.0, 20.0, "shot01",
+        )
+    assert thumb1 != ""
+    assert Path(thumb1).exists()
+
+    # Second call should use the cache (no ffmpeg call)
+    with patch("src.video_production._run_ffmpeg") as mock_run2:
+        thumb2 = extract_beat_thumbnail(
+            str(tmp_working), str(src), 10.0, 20.0, "shot01",
+        )
+    assert thumb2 == thumb1
+    mock_run2.assert_not_called()

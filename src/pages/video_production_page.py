@@ -1,62 +1,72 @@
-"""Stage 8 — Final Video Production UI.
+"""Stage 8 — Final Video Production UI (chat-driven).
 
-The user reviews the approved storyboard, provides feedback, and triggers
-the editing agent. The agent runs in a background thread with live tool
-call logging. The user can iterate with feedback to refine the edit.
+The user converses with an LLM agent via a chat interface to build an edit
+plan from the storyboard. The plan is displayed as a Linear Edit Plan (LEP)
+horizontal beat strip below the chat. Once approved via a confirmation
+dialog, the user clicks "Run Edit Plan" and a deterministic executor runs
+the queued ffmpeg commands with weighted progress and safe abort.
+
+On a command failure, the failure details are fed back to the chat agent,
+which proposes a fix via update_edit_plan. The user can then re-run with
+checkpoint reuse (completed clips are skipped).
+
+The storyboard is NOT shown on this screen — it's injected as context to
+the agent.
 """
 from __future__ import annotations
 
-import json
-
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QPlainTextEdit,
+    QMessageBox,
+    QProgressBar,
     QPushButton,
-    QScrollArea,
-    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
 from ..context import ContextStore
 from .. import paths
-from ..context_review import markdown_to_html
-from ..storyboard import load_latest_storyboard
+from ..video_production import (
+    EditPlan,
+    VideoProductionSettings,
+    clear_production,
+    extract_beat_thumbnail,
+    find_rendered_video,
+    load_chat,
+    load_edit_plan,
+    save_chat,
+)
+from ..workers.chat_agent_worker import ChatAgentWorker, build_system_context
+from ..workers.edit_executor_worker import EditExecutorWorker
+from .chat_widget import ChatMessage, ChatWidget
+from .debug_plan_dialog import DebugPlanDialog
+from .edit_plan_widget import EditPlanWidget
 from ..theme import (
-    COLOR_BORDER,
     COLOR_ON_SURFACE_VARIANT,
-    COLOR_SURFACE,
-    RADIUS_LG,
+    COLOR_DANGER,
+    COLOR_SUCCESS,
     SPACING_LG,
     SPACING_MD,
     SPACING_SM,
 )
-from ..video_production import (
-    VideoProductionSettings,
-    clear_production,
-    load_edit_plan,
-    load_tool_log,
-)
-from ..workers.video_production_worker import VideoProductionWorker
-from .context_review_page import _AutoTextBrowser
 
 
 class VideoProductionPage(QWidget):
-    """Stage 8 — produce the final video using an LLM editing agent."""
+    """Stage 8 — build an edit plan via chat, then run it."""
 
     def __init__(self, state, parent=None):
         super().__init__(parent)
         self._state = state
         self._store: ContextStore | None = None
-        self._worker: VideoProductionWorker | None = None
-        self._storyboard_md: str = ""
-        self._edit_plan = None       # EditPlan
-        self._edit_plan_json: str = ""
-        self._tool_log: list[dict] = []
+        self._chat_worker: ChatAgentWorker | None = None
+        self._exec_worker: EditExecutorWorker | None = None
+        self._system_context: str = ""
+        self._edit_plan: EditPlan | None = None
+        self._chat_messages: list[ChatMessage] = []
+        self._raw_chat_messages: list[dict] = []
         self._build()
 
     # --- UI ----------------------------------------------------------------
@@ -65,28 +75,44 @@ class VideoProductionPage(QWidget):
         root.setContentsMargins(SPACING_LG, SPACING_LG, SPACING_LG, SPACING_LG)
         root.setSpacing(SPACING_MD)
 
+        # Header
         header = QHBoxLayout()
         title = QLabel("Final Video Production")
         title.setProperty("class", "headline-md")
         header.addWidget(title)
         header.addStretch()
+        self.debug_btn = QPushButton("Debug")
+        self.debug_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.debug_btn.clicked.connect(self._on_debug)
+        header.addWidget(self.debug_btn)
         self.status_label = QLabel("")
         self.status_label.setProperty("class", "label-sm")
         header.addWidget(self.status_label)
         root.addLayout(header)
 
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._content = QWidget()
-        self._content_layout = QVBoxLayout(self._content)
-        self._content_layout.setContentsMargins(0, 0, 0, 0)
-        self._content_layout.setSpacing(SPACING_MD)
-        self.scroll.setWidget(self._content)
-        root.addWidget(self.scroll, 1)
+        # Chat widget (flexible height)
+        model_name = self._get_model_name()
+        self.chat_widget = ChatWidget(model_label=model_name)
+        self.chat_widget.message_sent.connect(self._on_user_send)
+        root.addWidget(self.chat_widget, 1)
 
-        root.addWidget(self._build_progress_block())
+        # LEP widget (fixed height horizontal strip)
+        self.plan_widget = EditPlanWidget()
+        self.plan_widget.beat_clicked.connect(self._on_beat_clicked)
+        root.addWidget(self.plan_widget)
 
+        # Progress bar (hidden until running)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setVisible(False)
+        root.addWidget(self.progress_bar)
+
+        self.progress_label = QLabel("")
+        self.progress_label.setProperty("class", "label-sm")
+        self.progress_label.setVisible(False)
+        root.addWidget(self.progress_label)
+
+        # Footer
         footer = QHBoxLayout()
         footer.addStretch()
         self.back_btn = QPushButton("Back")
@@ -97,30 +123,16 @@ class VideoProductionPage(QWidget):
         self.reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.reset_btn.clicked.connect(self._on_reset)
         footer.addWidget(self.reset_btn)
-        self.final_btn = QPushButton("Render Final")
-        self.final_btn.setProperty("class", "primary")
-        self.final_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.final_btn.clicked.connect(lambda: self._on_generate("youtube_1080p"))
-        footer.addWidget(self.final_btn)
+        self.run_btn = QPushButton("Run Edit Plan")
+        self.run_btn.setProperty("class", "primary")
+        self.run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.run_btn.clicked.connect(self._on_run)
+        footer.addWidget(self.run_btn)
         root.addLayout(footer)
 
-    def _build_progress_block(self) -> QWidget:
-        block = QFrame()
-        block.setProperty("class", "card")
-        lay = QVBoxLayout(block)
-        lay.setContentsMargins(SPACING_MD, SPACING_MD, SPACING_MD, SPACING_MD)
-        lay.setSpacing(SPACING_SM)
-        self.progress_label = QLabel("")
-        self.progress_label.setProperty("class", "label-md")
-        lay.addWidget(self.progress_label)
-        self.log_box = QPlainTextEdit()
-        self.log_box.setReadOnly(True)
-        self.log_box.setFixedHeight(120)
-        self.log_box.setProperty("class", "body-sm")
-        lay.addWidget(self.log_box)
-        block.setVisible(False)
-        self._progress_block = block
-        return block
+    def _get_model_name(self) -> str:
+        import os
+        return os.environ.get("OLLAMA_WORKFLOW_MODEL", "")
 
     # --- Lifecycle ---------------------------------------------------------
     def on_enter(self) -> None:
@@ -128,353 +140,320 @@ class VideoProductionPage(QWidget):
         if not self._state.working_folder:
             return
         self._store = ContextStore(paths.context_dir(self._state.working_folder))
-        self._storyboard_md = load_latest_storyboard(self._state.working_folder)
+
+        # Load existing edit plan
         self._edit_plan = load_edit_plan(self._state.working_folder)
-        self._tool_log = []
-        self._build_content()
+
+        # Load chat history
+        self._raw_chat_messages = load_chat(self._state.working_folder)
+        self._chat_messages = [ChatMessage.from_dict(m) for m in self._raw_chat_messages]
+        self.chat_widget.restore_from_messages(self._chat_messages)
+
+        # Build the system context (storyboard + context + ffmpeg reference)
+        # for the agent. This is built once on entry and reused.
+        selected = self._state.selected_videos
+        if selected:
+            try:
+                self._system_context = build_system_context(
+                    self._state.working_folder, self._store, selected,
+                )
+            except Exception as e:
+                self._system_context = ""
+                self.status_label.setText(f"Context build error: {e}")
+                self.status_label.setStyleSheet(f"color: {COLOR_DANGER};")
+
+        # Update LEP
+        self.plan_widget.update_plan(self._edit_plan)
+        if self._edit_plan and self._edit_plan.timeline:
+            self._extract_thumbnails()
+
         self._reset_button_states()
-        QTimer.singleShot(50, self._sync_content_width)
 
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        if self.scroll is not None and self._content is not None:
-            viewport_w = self.scroll.viewport().width()
-            if viewport_w > 0 and viewport_w != self._content.width():
-                self._content.resize(viewport_w, self._content.height())
-                self._sync_content_width()
-
-    # --- Content building --------------------------------------------------
-    def _build_content(self) -> None:
-        """Clear and rebuild the scrolling content."""
-        self.browser = None
-        self.tool_log_browser = None
-        self.edit_plan_browser = None
-
-        while self._content_layout.count():
-            item = self._content_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-
-        has_storyboard = bool(self._storyboard_md.strip())
-
-        if not has_storyboard:
-            self._content_layout.addWidget(self._build_empty_state())
-            self._content_layout.addStretch()
+    def _extract_thumbnails(self) -> None:
+        """Extract thumbnails for all beats in the current plan (async, deferred)."""
+        if not self._edit_plan or not self._state.working_folder:
             return
+        plan = self._edit_plan
+        wf = self._state.working_folder
+        wf_path = __import__("pathlib").Path(wf)
 
-        # --- Storyboard card (read-only) ---
-        self._content_layout.addWidget(self._build_storyboard_card())
+        def _do_extract():
+            for beat in plan.timeline:
+                # Skip if already cached
+                if beat.thumbnail_path and __import__("os").path.exists(beat.thumbnail_path):
+                    self.plan_widget.set_beat_thumbnail(beat.id, beat.thumbnail_path)
+                    continue
+                # Resolve the source filename to an absolute path in the
+                # working folder (beat.source is just the filename, not a path).
+                src_path = wf_path / beat.source
+                if not src_path.exists():
+                    continue
+                thumb = extract_beat_thumbnail(
+                    wf, str(src_path), beat.source_start, beat.source_end, beat.id,
+                )
+                if thumb:
+                    beat.thumbnail_path = thumb
+                    self.plan_widget.set_beat_thumbnail(beat.id, thumb)
 
-        # --- Feedback / prompt card ---
-        self._content_layout.addWidget(self._build_feedback_card())
+        # Run in a deferred timer so the UI loads first
+        QTimer.singleShot(100, _do_extract)
 
-        # --- Tool log card (only if there are tool calls) ---
-        if self._tool_log:
-            self._content_layout.addWidget(self._build_tool_log_card())
-
-        # --- Edit plan card (only if a plan exists) ---
-        if self._edit_plan is not None:
-            self._content_layout.addWidget(self._build_edit_plan_card())
-
-        self._content_layout.addStretch()
-
-    def _build_empty_state(self) -> QWidget:
-        card = QFrame()
-        card.setProperty("class", "card")
-        lay = QVBoxLayout(card)
-        lay.setContentsMargins(SPACING_MD, SPACING_MD, SPACING_MD, SPACING_MD)
-        lay.setSpacing(SPACING_SM)
-        lbl = QLabel("No storyboard found. Generate a storyboard in Stage 7 first.")
-        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl.setProperty("class", "body-md")
-        lbl.setStyleSheet(f"color: {COLOR_ON_SURFACE_VARIANT};")
-        lay.addWidget(lbl)
-        go_btn = QPushButton("Go to Storyboard")
-        go_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        go_btn.clicked.connect(lambda: self._state.set_stage(7))
-        lay.addWidget(go_btn, alignment=Qt.AlignmentFlag.AlignCenter)
-        return card
-
-    def _build_storyboard_card(self) -> QWidget:
-        card = QFrame()
-        card.setProperty("class", "card")
-        lay = QVBoxLayout(card)
-        lay.setContentsMargins(SPACING_MD, SPACING_MD, SPACING_MD, SPACING_MD)
-        lay.setSpacing(SPACING_SM)
-
-        title = QLabel("Approved Storyboard")
-        title.setProperty("class", "headline-sm")
-        lay.addWidget(title)
-
-        html = markdown_to_html(self._storyboard_md)
-        self.browser = self._make_text_browser(html)
-        lay.addWidget(self.browser)
-        return card
-
-    def _build_feedback_card(self) -> QWidget:
-        card = QFrame()
-        card.setProperty("class", "card")
-        lay = QVBoxLayout(card)
-        lay.setContentsMargins(SPACING_MD, SPACING_MD, SPACING_MD, SPACING_MD)
-        lay.setSpacing(SPACING_SM)
-
-        title = QLabel("Feedback")
-        title.setProperty("class", "headline-sm")
-        lay.addWidget(title)
-
-        desc = QLabel(
-            "Enter feedback to refine the edit, or leave empty for an "
-            "initial render from the storyboard."
-        )
-        desc.setProperty("class", "body-sm")
-        desc.setStyleSheet(f"color: {COLOR_ON_SURFACE_VARIANT};")
-        desc.setWordWrap(True)
-        lay.addWidget(desc)
-
-        self.feedback_input = QPlainTextEdit()
-        self.feedback_input.setPlaceholderText(
-            "e.g. Make the opening shorter.\n"
-            "e.g. Use more of the kids talking.\n"
-            "e.g. The ending is too abrupt."
-        )
-        _line_h = int(self.feedback_input.fontMetrics().lineSpacing())
-        _h = 3 * _line_h + 2 * SPACING_MD + 8
-        self.feedback_input.setFixedHeight(_h)
-        self.feedback_input.setSizePolicy(
-            self.feedback_input.sizePolicy().Policy.Expanding,
-            self.feedback_input.sizePolicy().Policy.Fixed,
-        )
-        self.feedback_input.setProperty("class", "body-md")
-        lay.addWidget(self.feedback_input)
-
-        # Restore last feedback
-        if self._state.video_production_settings.last_feedback:
-            self.feedback_input.setPlainText(
-                self._state.video_production_settings.last_feedback
-            )
-
-        return card
-
-    def _build_tool_log_card(self) -> QWidget:
-        card = QFrame()
-        card.setProperty("class", "card")
-        lay = QVBoxLayout(card)
-        lay.setContentsMargins(SPACING_MD, SPACING_MD, SPACING_MD, SPACING_MD)
-        lay.setSpacing(SPACING_SM)
-
-        title = QLabel("Tool Execution Log")
-        title.setProperty("class", "headline-sm")
-        lay.addWidget(title)
-
-        lines: list[str] = []
-        for entry in self._tool_log:
-            tool = entry.get("tool", "?")
-            success = entry.get("success", False)
-            dur = entry.get("duration_s", 0.0)
-            args = entry.get("args", {})
-            args_str = json.dumps(args) if isinstance(args, dict) else str(args)
-            status = "OK" if success else "FAIL"
-            lines.append(f"[{tool}] {status} ({dur:.1f}s) {args_str}")
-
-        self.tool_log_browser = self._make_text_browser(
-            "<pre>" + "\n".join(lines) + "</pre>"
-            if lines else "<i>No tool calls yet.</i>"
-        )
-        lay.addWidget(self.tool_log_browser)
-        return card
-
-    def _build_edit_plan_card(self) -> QWidget:
-        card = QFrame()
-        card.setProperty("class", "card")
-        lay = QVBoxLayout(card)
-        lay.setContentsMargins(SPACING_MD, SPACING_MD, SPACING_MD, SPACING_MD)
-        lay.setSpacing(SPACING_SM)
-
-        title = QLabel("Edit Plan")
-        title.setProperty("class", "headline-sm")
-        lay.addWidget(title)
-
-        # Status line (plan lifecycle: draft → executing → rendered → verified)
-        if self._edit_plan is not None and self._edit_plan.status:
-            status = self._edit_plan.status
-        else:
-            status = "draft"
-        self._edit_plan_status_label = QLabel(f"Status: {status}")
-        self._edit_plan_status_label.setProperty("class", "label-sm")
-        self._edit_plan_status_label.setStyleSheet(f"color: {COLOR_ON_SURFACE_VARIANT};")
-        lay.addWidget(self._edit_plan_status_label)
-
-        # Per-shot traceability table (rendered as HTML) — placed above the
-        # raw JSON so the structured plan is easy to scan at a glance.
-        if self._edit_plan is not None and self._edit_plan.timeline:
-            self.traceability_browser = self._make_text_browser(
-                _build_traceability_html(self._edit_plan)
-            )
-        else:
-            self.traceability_browser = self._make_text_browser(
-                "<i>No shots in the plan yet.</i>"
-            )
-        lay.addWidget(self.traceability_browser)
-
-        # Raw JSON (kept for power users / debugging).
-        if self._edit_plan is not None:
-            plan_json = self._edit_plan.model_dump_json(indent=2)
-        else:
-            plan_json = "{}"
-        self._edit_plan_json = plan_json
-
-        self.edit_plan_browser = self._make_text_browser(
-            "<pre>" + _escape_html(plan_json) + "</pre>"
-        )
-        lay.addWidget(self.edit_plan_browser)
-        return card
-
-    # --- Widget factory helpers --------------------------------------------
-    def _make_text_browser(self, html: str) -> QTextBrowser:
-        browser = _AutoTextBrowser()
-        browser.setOpenExternalLinks(False)
-        browser.setProperty("class", "body-sm")
-        browser.setStyleSheet(
-            f"QTextBrowser {{ background-color: {COLOR_SURFACE}; "
-            f"border: 1px solid {COLOR_BORDER}; "
-            f"border-radius: {RADIUS_LG}px; "
-            f"padding: {SPACING_MD}px; }}"
-        )
-        browser.setHtml(html)
-        return browser
-
-    # --- Sync content width + scrollbar -----------------------------------
-    def _sync_content_width(self) -> None:
-        if self.scroll is None or self._content is None:
-            return
-        app = QApplication.instance()
-        if app is not None:
-            app.processEvents()
-        viewport_w = self.scroll.viewport().width()
-        if viewport_w > 0:
-            self._content.resize(viewport_w, self._content.height())
-        from PyQt6 import sip
-        if hasattr(self, "browser") and self.browser is not None and not sip.isdeleted(self.browser):
-            self.browser._adjust_height()
-        if hasattr(self, "tool_log_browser") and self.tool_log_browser is not None and not sip.isdeleted(self.tool_log_browser):
-            self.tool_log_browser._adjust_height()
-        if hasattr(self, "traceability_browser") and self.traceability_browser is not None and not sip.isdeleted(self.traceability_browser):
-            self.traceability_browser._adjust_height()
-        if hasattr(self, "edit_plan_browser") and self.edit_plan_browser is not None and not sip.isdeleted(self.edit_plan_browser):
-            self.edit_plan_browser._adjust_height()
-        min_h = self._content_layout.minimumSize().height()
-        hint_h = self._content_layout.sizeHint().height()
-        content_h = max(min_h, hint_h)
-        if content_h > 0:
-            self._content.setMinimumHeight(content_h)
-            viewport_h = self.scroll.viewport().height()
-            scroll_range = max(0, content_h - viewport_h)
-            sb = self.scroll.verticalScrollBar()
-            sb.setRange(0, scroll_range)
-            sb.setPageStep(max(1, viewport_h))
-            sb.setSingleStep(20)
-
-    # --- Generate / Refine -------------------------------------------------
-    def _is_busy(self) -> bool:
-        return self._worker is not None and self._worker.isRunning()
-
-    def _on_generate(self, preset: str) -> None:
-        if self._is_busy():
+    # --- Chat ---------------------------------------------------------------
+    def _on_user_send(self, text: str) -> None:
+        """The user sent a message — start a chat agent turn."""
+        if self._chat_worker is not None and self._chat_worker.isRunning():
             return
         if not self._state.working_folder or self._store is None:
             return
-        from ..video_production import is_config_valid
-        ok, msg = is_config_valid()
-        if not ok:
-            from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.warning(self, "Configuration missing", msg)
-            return
 
-        selected_videos = self._state.selected_videos
-        if not selected_videos:
-            self.status_label.setText("No videos selected.")
-            self.status_label.setStyleSheet("color: #ef4444;")
-            return
+        # Show the user message immediately
+        msg = self.chat_widget.add_user_message(text)
+        self._chat_messages.append(msg)
 
-        feedback = self.feedback_input.toPlainText().strip()
-        self._state.set_video_production_settings(
-            VideoProductionSettings(last_feedback=feedback)
-        )
+        # Disable input while thinking
+        self.chat_widget.set_input_enabled(False)
+        self.run_btn.setEnabled(False)
 
-        is_refinement = self._edit_plan is not None and bool(feedback)
-
-        self._progress_block.setVisible(True)
-        self.log_box.clear()
-        self._set_buttons_busy(True)
-
-        self._worker = VideoProductionWorker(
-            feedback=feedback,
-            existing_edit_plan_json=self._edit_plan_json if is_refinement else None,
+        # Start the worker
+        self._chat_worker = ChatAgentWorker(
+            messages=self._raw_chat_messages,
+            user_message=text,
+            failure_context=None,
             working_folder=self._state.working_folder,
-            selected_videos=selected_videos,
+            selected_videos=self._state.selected_videos,
             context_store=self._store,
-            is_refinement=is_refinement,
-            render_preset=preset,
+            system_context=self._system_context,
             parent=self,
         )
-        self._worker.progress.connect(self._on_progress)
-        self._worker.log.connect(self._on_log)
-        self._worker.finished_success.connect(self._on_finished_success)
-        self._worker.finished_error.connect(self._on_finished_error)
-        self._worker.start()
+        self._chat_worker.thinking_started.connect(self._on_thinking_started)
+        self._chat_worker.tool_called.connect(self._on_tool_called)
+        self._chat_worker.assistant_text.connect(self._on_assistant_text)
+        self._chat_worker.plan_updated.connect(self._on_plan_updated)
+        self._chat_worker.thinking_ended.connect(self._on_thinking_ended)
+        self._chat_worker.finished_error.connect(self._on_chat_error)
+        self._chat_worker.start()
 
-    def _on_progress(self, msg: str) -> None:
-        self.progress_label.setText(msg)
+    def _on_thinking_started(self) -> None:
+        self.chat_widget.show_thinking(sender=self._get_model_name())
 
-    def _on_log(self, msg: str) -> None:
-        self.log_box.appendPlainText(msg)
+    def _on_tool_called(self, tool_name: str, args_str: str,
+                        result_str: str, success: bool, duration: float) -> None:
+        msg = self.chat_widget.add_tool_chip(
+            tool_name, args_str, result_str, success, duration,
+        )
+        self._chat_messages.append(msg)
 
-    def _on_finished_success(self, edit_plan) -> None:
-        self._progress_block.setVisible(False)
-        self.status_label.setText("Video production complete.")
-        self.status_label.setStyleSheet(f"color: {COLOR_ON_SURFACE_VARIANT};")
-        self._edit_plan = edit_plan
-        self._edit_plan_json = edit_plan.model_dump_json(indent=2) if edit_plan else ""
-        self._tool_log = load_tool_log(self._state.working_folder)
-        self._build_content()
-        self._reset_button_states()
-        QTimer.singleShot(50, self._sync_content_width)
-        # Auto-navigate to the Result stage only if a video was actually
-        # rendered (a file exists in the output directory).
-        if self._state.working_folder:
-            from ..video_production import find_rendered_video
-            if find_rendered_video(self._state.working_folder) is not None:
-                self._state.set_stage(9)
+    def _on_assistant_text(self, text: str) -> None:
+        self.chat_widget.hide_thinking()
+        msg = self.chat_widget.add_assistant_message(text, sender=self._get_model_name())
+        self._chat_messages.append(msg)
 
-    def _on_finished_error(self, msg: str) -> None:
-        self._progress_block.setVisible(False)
-        self.status_label.setText(f"Error: {msg}")
-        self.status_label.setStyleSheet("color: #ef4444;")
+    def _on_plan_updated(self, plan: EditPlan) -> None:
+        self._edit_plan = plan
+        self.plan_widget.update_plan(plan)
+        if plan and plan.timeline:
+            self._extract_thumbnails()
         self._reset_button_states()
 
-    def _set_buttons_busy(self, busy: bool) -> None:
-        self.final_btn.setEnabled(not busy)
-        self.back_btn.setEnabled(not busy)
-        self.reset_btn.setEnabled(not busy)
+    def _on_thinking_ended(self) -> None:
+        self.chat_widget.hide_thinking()
+        self.chat_widget.set_input_enabled(True)
+        # Persist the raw chat messages from the worker
+        if self._chat_worker is not None:
+            self._raw_chat_messages = self._chat_worker.updated_messages
+        self._reset_button_states()
 
-    def _reset_button_states(self) -> None:
-        has_storyboard = bool(self._storyboard_md.strip())
-        self.final_btn.setEnabled(has_storyboard)
-        self.back_btn.setEnabled(True)
-        self.reset_btn.setEnabled(has_storyboard and not self._is_busy())
+    def _on_chat_error(self, msg: str) -> None:
+        self.chat_widget.hide_thinking()
+        self.chat_widget.set_input_enabled(True)
+        self.status_label.setText(f"Chat error: {msg}")
+        self.status_label.setStyleSheet(f"color: {COLOR_DANGER};")
+        self._reset_button_states()
 
-    # --- Reset -------------------------------------------------------------
-    def _on_reset(self) -> None:
-        if self._is_busy():
+    # --- Execution failure feedback to agent --------------------------------
+    def _feed_failure_to_agent(self, failure_info: dict) -> None:
+        """Inject an execution failure into the chat for the agent to fix."""
+        if self._chat_worker is not None and self._chat_worker.isRunning():
+            return
+        if not self._state.working_folder or self._store is None:
+            return
+
+        # Show a system message about the failure
+        fail_msg = (
+            f"⚠️ Execution failed at command '{failure_info.get('command_id')}' "
+            f"({failure_info.get('command_type')}). I've asked the agent to "
+            f"propose a fix."
+        )
+        msg = self.chat_widget.add_assistant_message(fail_msg, sender="system")
+        self._chat_messages.append(msg)
+
+        self.chat_widget.set_input_enabled(False)
+        self.run_btn.setEnabled(False)
+
+        self._chat_worker = ChatAgentWorker(
+            messages=self._raw_chat_messages,
+            user_message=None,
+            failure_context=failure_info,
+            working_folder=self._state.working_folder,
+            selected_videos=self._state.selected_videos,
+            context_store=self._store,
+            system_context=self._system_context,
+            parent=self,
+        )
+        self._chat_worker.thinking_started.connect(self._on_thinking_started)
+        self._chat_worker.tool_called.connect(self._on_tool_called)
+        self._chat_worker.assistant_text.connect(self._on_assistant_text)
+        self._chat_worker.plan_updated.connect(self._on_plan_updated)
+        self._chat_worker.thinking_ended.connect(self._on_thinking_ended)
+        self._chat_worker.finished_error.connect(self._on_chat_error)
+        self._chat_worker.start()
+
+    # --- Run edit plan ------------------------------------------------------
+    def _on_run(self) -> None:
+        """Open a confirmation dialog, then start execution."""
+        if self._exec_worker is not None and self._exec_worker.isRunning():
+            # Currently running → abort
+            self._exec_worker.cancel()
+            return
+        if self._edit_plan is None or not self._edit_plan.commands:
+            self.status_label.setText("No commands to run. Build a plan first.")
+            self.status_label.setStyleSheet(f"color: {COLOR_DANGER};")
             return
         if not self._state.working_folder:
             return
-        from PyQt6.QtWidgets import QMessageBox
+
+        plan = self._edit_plan
+        beats = len(plan.timeline)
+        cmds = len(plan.commands)
+        duration = plan.target_duration or 0.0
+        preset = plan.preset
+
+        # Confirmation dialog
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Approve & Run Edit Plan")
+        msg_box.setIcon(QMessageBox.Icon.Question)
+        msg_box.setText(
+            f"Ready to execute the edit plan?\n\n"
+            f"  Beats: {beats}\n"
+            f"  Commands: {cmds}\n"
+            f"  Target duration: {duration:.1f}s\n"
+            f"  Preset: {preset}\n\n"
+            f"This will run {cmds} ffmpeg operations sequentially. "
+            f"You can abort safely at any time."
+        )
+        approve_btn = msg_box.addButton("Approve & Run", QMessageBox.ButtonRole.AcceptRole)
+        msg_box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        approve_btn.setStyleSheet(f"font-weight: 600;")
+        if msg_box.exec() != QMessageBox.ButtonRole.AcceptRole.value and \
+                msg_box.clickedButton() is not approve_btn:
+            return
+
+        # Mark plan as approved + start execution
+        plan.status = "approved"
+        from ..video_production import save_edit_plan
+        save_edit_plan(self._state.working_folder, plan)
+
+        self.progress_bar.setVisible(True)
+        self.progress_label.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.run_btn.setText("Abort")
+        self.run_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {COLOR_DANGER}; color: #ffffff; "
+            f"border: 1px solid {COLOR_DANGER}; }}"
+        )
+        self.back_btn.setEnabled(False)
+        self.reset_btn.setEnabled(False)
+        self.debug_btn.setEnabled(False)
+
+        self._exec_worker = EditExecutorWorker(
+            working_folder=self._state.working_folder,
+            plan=plan,
+            parent=self,
+        )
+        self._exec_worker.progress.connect(self._on_exec_progress)
+        self._exec_worker.log.connect(self._on_exec_log)
+        self._exec_worker.finished_success.connect(self._on_exec_success)
+        self._exec_worker.finished_error.connect(self._on_exec_error)
+        self._exec_worker.start()
+
+    def _on_exec_progress(self, p) -> None:
+        pct = int(p.overall * 100)
+        self.progress_bar.setValue(pct)
+        self.progress_label.setText(
+            f"{p.stage}: {p.message}  ({pct}%)"
+        )
+
+    def _on_exec_log(self, msg: str) -> None:
+        # Could route to a debug log; for now, update the status label.
+        pass
+
+    def _on_exec_success(self, plan: EditPlan) -> None:
+        self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
+        self.status_label.setText("Video production complete.")
+        self.status_label.setStyleSheet(f"color: {COLOR_SUCCESS};")
+        self._edit_plan = plan
+        self._reset_button_states()
+        # Auto-navigate to Result if a video was rendered
+        if self._state.working_folder:
+            if find_rendered_video(self._state.working_folder) is not None:
+                self._state.set_stage(9)
+
+    def _on_exec_error(self, msg: str, failure_info) -> None:
+        self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
+        self.status_label.setText(f"Execution failed: {msg[:100]}")
+        self.status_label.setStyleSheet(f"color: {COLOR_DANGER};")
+        self._reset_button_states()
+        # Feed the failure back to the chat agent for a fix proposal
+        if failure_info is not None:
+            self._feed_failure_to_agent(failure_info)
+
+    # --- Debug --------------------------------------------------------------
+    def _on_debug(self) -> None:
+        dlg = DebugPlanDialog(self._edit_plan, self._state.working_folder, self)
+        dlg.exec()
+
+    # --- Beat click ---------------------------------------------------------
+    def _on_beat_clicked(self, beat_id: str) -> None:
+        """A beat was clicked — could focus it or show details. V1: no-op."""
+        pass
+
+    # --- Button states ------------------------------------------------------
+    def _reset_button_states(self) -> None:
+        has_plan = self._edit_plan is not None and bool(self._edit_plan.commands)
+        is_executing = self._exec_worker is not None and self._exec_worker.isRunning()
+        is_chatting = self._chat_worker is not None and self._chat_worker.isRunning()
+
+        if is_executing:
+            self.run_btn.setText("Abort")
+            self.run_btn.setEnabled(True)
+            self.run_btn.setStyleSheet(
+                f"QPushButton {{ background-color: {COLOR_DANGER}; color: #ffffff; "
+                f"border: 1px solid {COLOR_DANGER}; }}"
+            )
+            self.back_btn.setEnabled(False)
+            self.reset_btn.setEnabled(False)
+        else:
+            self.run_btn.setText("Run Edit Plan")
+            self.run_btn.setEnabled(has_plan and not is_chatting)
+            self.run_btn.setStyleSheet("")  # reset to QSS default
+            self.back_btn.setEnabled(True)
+            self.reset_btn.setEnabled(has_plan and not is_chatting)
+        self.debug_btn.setEnabled(self._edit_plan is not None)
+
+    # --- Reset --------------------------------------------------------------
+    def _on_reset(self) -> None:
+        if self._exec_worker is not None and self._exec_worker.isRunning():
+            return
+        if self._chat_worker is not None and self._chat_worker.isRunning():
+            return
+        if not self._state.working_folder:
+            return
         reply = QMessageBox.question(
             self, "Reset Production",
             "This will permanently delete all video production artefacts "
-            "(clips, output, edit plan, tool log). This cannot be undone.\n\n"
+            "(chat, edit plan, clips, output). This cannot be undone.\n\n"
             "Are you sure?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -483,73 +462,15 @@ class VideoProductionPage(QWidget):
             return
         clear_production(self._state.working_folder)
         self._edit_plan = None
-        self._edit_plan_json = ""
-        self._tool_log = []
+        self._chat_messages = []
+        self._raw_chat_messages = []
+        self.chat_widget.clear_messages()
+        self.plan_widget.update_plan(None)
         self._state.set_video_production_settings(VideoProductionSettings(last_feedback=""))
         self.status_label.setText("Production reset.")
         self.status_label.setStyleSheet(f"color: {COLOR_ON_SURFACE_VARIANT};")
-        self._build_content()
         self._reset_button_states()
-        QTimer.singleShot(50, self._sync_content_width)
 
     # --- Navigation --------------------------------------------------------
     def _on_back(self) -> None:
         self._state.set_stage(7)
-
-
-def _escape_html(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def _build_traceability_html(edit_plan) -> str:
-    """Render the edit plan's timeline as a per-shot traceability table.
-
-    Columns: Shot | Scene | Source | Start–End | Clip | Purpose.
-    Placed above the raw JSON in the Edit Plan card so the structured plan
-    is easy to scan at a glance.
-    """
-    rows = []
-    for item in edit_plan.timeline:
-        start_end = (
-            f"{item.source_start:.1f}–{item.source_end:.1f}s"
-            if item.source_start is not None and item.source_end is not None
-            else "—"
-        )
-        scene = _escape_html(item.storyboard_scene or item.storyboard_shot or "")
-        purpose = _escape_html(item.purpose or "")
-        clip = _escape_html(item.intermediate_clip or "")
-        src = _escape_html(item.source or "")
-        shot_id = _escape_html(item.id or "")
-        rows.append(
-            "<tr>"
-            f"<td><b>{shot_id}</b></td>"
-            f"<td>{scene}</td>"
-            f"<td>{src}</td>"
-            f"<td>{start_end}</td>"
-            f"<td>{clip}</td>"
-            f"<td>{purpose}</td>"
-            "</tr>"
-        )
-    if not rows:
-        return "<i>No shots in the plan.</i>"
-    header = (
-        "<tr>"
-        "<th align='left'>Shot</th>"
-        "<th align='left'>Scene</th>"
-        "<th align='left'>Source</th>"
-        "<th align='left'>Start–End</th>"
-        "<th align='left'>Clip</th>"
-        "<th align='left'>Purpose</th>"
-        "</tr>"
-    )
-    style = (
-        "table { border-collapse: collapse; width: 100%; }"
-        "th, td { padding: 4px 8px; border-bottom: 1px solid #2a3344; "
-        "vertical-align: top; text-align: left; }"
-        "th { font-weight: 600; }"
-    )
-    return (
-        f"<style>{style}</style>"
-        f"<p><b>{len(rows)} shot(s)</b> · status: {_escape_html(edit_plan.status or 'draft')}</p>"
-        f"<table>{header}{''.join(rows)}</table>"
-    )
