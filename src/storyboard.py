@@ -61,6 +61,7 @@ Identify and use the best available moments from the source footage, including:
 Where possible, reference the source video and timestamp when recommending footage.
 
 Do not invent footage, dialogue, events, people, locations, or visual content that is not supported by the provided context.
+Do not intentionally overlap or repeat footage unless the context indicates that it is appropriate and the user specifies that it is desired.
 
 If the available footage does not contain something required by the user's concept, clearly identify the gap rather than inventing a clip.
 
@@ -87,6 +88,20 @@ Only recommend background music if the user explicitly requests it.
 If important information about the desired video format, design, content, audience, duration, platform, or creative direction is genuinely missing and prevents you from producing a good storyboard, ask the user a concise question.
 
 Otherwise, make sensible creative decisions based on the user's brief and the available context.
+
+## Editor Capabilities Awareness
+
+The storyboard you produce will be executed by an automated video editor. \
+A description of the editor's practical capabilities and constraints is \
+provided in the Available Context. Your storyboard must stay within those \
+capabilities so it is practical to implement.
+
+Crucially, the storyboard itself must be written in plain English. Never \
+reference tools, function names, or technical operations. Describe the \
+creative intent — what the audience should see and hear — and reference \
+source footage by exact filename and approximate timestamp range where \
+the context supports it. Do not invent footage or timestamps that the \
+provided context does not support.
 """
 
 
@@ -185,17 +200,24 @@ _EMPTY_FRAME_ANALYSIS = "_Not yet generated._"
 
 def build_context_markdown(project_ctx: str,
                             video_sections: list,
-                            video_metadatas: list) -> str:
+                            video_metadatas: list,
+                            working_folder: str = "") -> str:
     """Assemble all available context into a single structured Markdown document.
 
     ``video_sections`` is a list of ``context_review.VideoSection`` objects
     (from ``load_assembled``). ``video_metadatas`` is a list of
-    ``VideoMetadata`` objects.
+    ``VideoMetadata`` objects. ``working_folder`` is the project folder used
+    to scan for available background-music files (audio files placed in the
+    working folder are surfaced to the storyboard and editor).
 
     The structure is:
 
       # Project Context
       <project content>
+
+      # Available Music Files
+      - <audio filename>
+      ...
 
       # Video Metadata
       ## <video1 filename>
@@ -226,6 +248,22 @@ def build_context_markdown(project_ctx: str,
     pbody = _strip_leading_heading(project_ctx, "# Project Context").strip()
     parts.append(pbody if pbody else _EMPTY_PROJECT)
     parts.append("")
+
+    # --- Available Music Files ---
+    # Audio files in the working folder (e.g. background music) are surfaced
+    # so the storyboard and editor can reference them by exact filename.
+    if working_folder:
+        from .state import AUDIO_EXTENSIONS
+        music_files = _list_audio_files(working_folder, AUDIO_EXTENSIONS)
+        if music_files:
+            parts.append("# Available Music Files")
+            parts.append("")
+            parts.append("Audio files in the project folder that can be used "
+                         "as background music. Reference them by exact filename.")
+            parts.append("")
+            for name in music_files:
+                parts.append(f"- `{name}`")
+            parts.append("")
 
     # --- Video Metadata ---
     if video_metadatas:
@@ -262,6 +300,25 @@ def build_context_markdown(project_ctx: str,
     return "\n".join(parts).rstrip() + "\n"
 
 
+def _list_audio_files(working_folder: str, extensions: set[str]) -> list[str]:
+    """Return a sorted list of audio filenames in the working folder.
+
+    Only top-level files (not subdirectories) whose suffix matches one of the
+    given extensions are returned. Returns [] if the folder is missing or no
+    audio files are found.
+    """
+    if not working_folder:
+        return []
+    p = Path(working_folder)
+    if not p.is_dir():
+        return []
+    out: list[str] = []
+    for entry in sorted(p.iterdir()):
+        if entry.is_file() and entry.suffix.lower() in extensions:
+            out.append(entry.name)
+    return out
+
+
 # --- Prompt building --------------------------------------------------------
 
 def build_generation_prompt(brief: str, context_md: str) -> str:
@@ -270,16 +327,22 @@ def build_generation_prompt(brief: str, context_md: str) -> str:
     The system prompt (STORYBOARD_SYSTEM_PROMPT) is sent as a separate
     ``system`` role message in the chat call; this function returns only the
     user-role content.
+
+    Includes an Editor Capabilities block so the storyboard stays practical
+    to implement (the block is plain English and contains no tool names).
     """
+    from .editor_capabilities import capabilities_block
     return (
         f"## Creative Brief\n\n{brief.strip()}\n\n"
         f"## Available Context\n\n{context_md.strip()}\n\n"
+        f"{capabilities_block()}\n\n"
         f"## Task\n\n"
         f"Develop a detailed storyboard based on the creative brief and the "
         f"available context. Follow the structure described in your "
         f"instructions. Reference source videos and timestamps where the "
         f"context supports them. Do not invent footage that is not in the "
-        f"context. Return the complete storyboard as Markdown."
+        f"context. Return the complete storyboard as Markdown. Keep it in "
+        f"plain English and do not reference tools or technical operations."
     )
 
 
@@ -291,17 +354,22 @@ def build_refinement_prompt(new_prompt: str, existing_storyboard: str,
     full context so the LLM can validate and improve source selections.
     The refinement instructions (REFINEMENT_INSTRUCTIONS) are included here
     so the model treats the new prompt as a refinement, not a fresh start.
+
+    Also includes the Editor Capabilities block so refinements stay practical.
     """
+    from .editor_capabilities import capabilities_block
     return (
         f"{REFINEMENT_INSTRUCTIONS.strip()}\n\n"
         f"## Existing Storyboard\n\n{existing_storyboard.strip()}\n\n"
         f"## User's New Instruction\n\n{new_prompt.strip()}\n\n"
         f"## Available Context\n\n{context_md.strip()}\n\n"
+        f"{capabilities_block()}\n\n"
         f"## Task\n\n"
         f"Apply the user's new instruction to refine the existing storyboard. "
         f"Preserve good decisions from the existing storyboard unless the "
         f"user's instruction requires them to change. Return the complete "
-        f"revised storyboard as Markdown."
+        f"revised storyboard as Markdown. Keep it in plain English and do not "
+        f"reference tools or technical operations."
     )
 
 

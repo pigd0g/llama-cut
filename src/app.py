@@ -28,11 +28,13 @@ from .pages.select_frames_page import SelectFramesPage
 from .pages.select_videos_page import SelectVideosPage
 from .pages.storyboard_page import StoryboardPage
 from .pages.transcription_page import TranscriptionPage
+from .pages.video_production_page import VideoProductionPage
 from .pages.welcome_page import WelcomePage
 
 
 # Stage indices: 0=Welcome, 1=Select Videos, 2=Context, 3=Transcription,
-# 4=Frame Generation, 5=Select Frames, 6=Context Review, 7=Storyboard
+# 4=Frame Generation, 5=Select Frames, 6=Context Review, 7=Storyboard,
+# 8=Final Video
 NAV_ICONS = {
     0: "\ue8cc",  # folder
     1: "\ue8cc",  # folder
@@ -42,6 +44,7 @@ NAV_ICONS = {
     5: "\ue413",  # photo_library
     6: "\ue873",  # description / article (context review)
     7: "\ue873",  # description / article (storyboard)
+    8: "\ue02a",  # video (final video)
 }
 NAV_LABELS = {
     0: "Welcome",
@@ -52,6 +55,7 @@ NAV_LABELS = {
     5: "5 · Analyse Frames",
     6: "6 · Context Review",
     7: "7 · Storyboard",
+    8: "8 · Final Video",
 }
 
 
@@ -84,14 +88,16 @@ class AppShell(QMainWindow):
         self.stage5 = SelectFramesPage(self._state)
         self.context_review_page = ContextReviewPage(self._state)
         self.storyboard_page = StoryboardPage(self._state)
+        self.video_production_page = VideoProductionPage(self._state)
         self.stack.addWidget(self.welcome_page)        # index 0
         self.stack.addWidget(self.stage1)              # index 1
         self.stack.addWidget(self.context_page)        # index 2
-        self.stack.addWidget(self.transcription_page)   # index 3
+        self.stack.addWidget(self.transcription_page)  # index 3
         self.stack.addWidget(self.stage4)               # index 4
         self.stack.addWidget(self.stage5)               # index 5
         self.stack.addWidget(self.context_review_page)  # index 6
         self.stack.addWidget(self.storyboard_page)     # index 7
+        self.stack.addWidget(self.video_production_page) # index 8
         right_col.addWidget(self.stack, 1)
         right_widget = QWidget()
         right_widget.setLayout(right_col)
@@ -143,7 +149,7 @@ class AppShell(QMainWindow):
         return bar
 
     def _build_nav_items(self) -> None:
-        for stage in (0, 1, 2, 3, 4, 5, 6, 7):
+        for stage in (0, 1, 2, 3, 4, 5, 6, 7, 8):
             btn = QToolButton()
             btn.setObjectName("sidebarNavItem")
             btn.setProperty("active", False)
@@ -213,6 +219,8 @@ class AppShell(QMainWindow):
             self.context_review_page.on_enter()
         elif stage == 7:
             self.storyboard_page.on_enter()
+        elif stage == 8:
+            self.video_production_page.on_enter()
 
     def _on_nav_click(self, stage: int) -> None:
         if stage == 0:
