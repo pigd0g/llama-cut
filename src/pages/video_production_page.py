@@ -97,11 +97,6 @@ class VideoProductionPage(QWidget):
         self.reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.reset_btn.clicked.connect(self._on_reset)
         footer.addWidget(self.reset_btn)
-        self.preview_btn = QPushButton("Render Preview")
-        self.preview_btn.setProperty("class", "primary")
-        self.preview_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.preview_btn.clicked.connect(lambda: self._on_generate("preview"))
-        footer.addWidget(self.preview_btn)
         self.final_btn = QPushButton("Render Final")
         self.final_btn.setProperty("class", "primary")
         self.final_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -445,6 +440,12 @@ class VideoProductionPage(QWidget):
         self._build_content()
         self._reset_button_states()
         QTimer.singleShot(50, self._sync_content_width)
+        # Auto-navigate to the Result stage only if a video was actually
+        # rendered (a file exists in the output directory).
+        if self._state.working_folder:
+            from ..video_production import find_rendered_video
+            if find_rendered_video(self._state.working_folder) is not None:
+                self._state.set_stage(9)
 
     def _on_finished_error(self, msg: str) -> None:
         self._progress_block.setVisible(False)
@@ -453,14 +454,12 @@ class VideoProductionPage(QWidget):
         self._reset_button_states()
 
     def _set_buttons_busy(self, busy: bool) -> None:
-        self.preview_btn.setEnabled(not busy)
         self.final_btn.setEnabled(not busy)
         self.back_btn.setEnabled(not busy)
         self.reset_btn.setEnabled(not busy)
 
     def _reset_button_states(self) -> None:
         has_storyboard = bool(self._storyboard_md.strip())
-        self.preview_btn.setEnabled(has_storyboard)
         self.final_btn.setEnabled(has_storyboard)
         self.back_btn.setEnabled(True)
         self.reset_btn.setEnabled(has_storyboard and not self._is_busy())

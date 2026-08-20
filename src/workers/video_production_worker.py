@@ -31,6 +31,7 @@ from ..video_production import (
     build_generation_prompt,
     build_refinement_prompt,
     build_ollama_client,
+    find_rendered_video,
     is_config_valid,
     load_edit_plan,
     load_video_production_config,
@@ -245,6 +246,15 @@ class VideoProductionWorker(QThread):
             edit_plan.notes = final_text
             if self._render_preset and not edit_plan.preset:
                 edit_plan.preset = self._render_preset
+            save_edit_plan(self._working_folder, edit_plan)
+
+        # Populate output_path from the rendered file (if one exists) so the
+        # result page has a direct reference without re-scanning the output dir.
+        rendered = find_rendered_video(self._working_folder)
+        if rendered is not None:
+            edit_plan.output_path = str(rendered)
+            if edit_plan.status in ("draft", "executing"):
+                edit_plan.status = "rendered"
             save_edit_plan(self._working_folder, edit_plan)
 
         save_tool_log(self._working_folder, tool_log)

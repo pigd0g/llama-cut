@@ -57,7 +57,7 @@ This project is not a library — install with `pip`, not a package manager.
 
 ## Pipeline Stages (Quick Reference)
 
-The app is an 8-stage guided pipeline. Stages run in order; each persists its
+The app is a 9-stage guided pipeline. Stages run in order; each persists its
 output to the working folder so work survives navigation and app restarts.
 The navigation sidebar (`src/app.py`) drives stage switching via
 `PipelineState` (`src/state.py`).
@@ -122,9 +122,21 @@ The navigation sidebar (`src/app.py`) drives stage switching via
 - Agentic, two-phase LLM editor (plan-then-execute) renders the final video
   from the storyboard. See the "Stage 8 — Final Video Production" section
   below for the full philosophy, tool set, and deferred optimisations.
+- On a successful render, auto-navigates to Stage 9 (Result).
 - Output: `video/clips/*.mp4` (intermediate clips, kept as checkpoints),
   `video/edit_plan.json`, `video/tool_log.json`, and the rendered video in
   `video/output/` (final) or `video/preview/` (preview preset).
+
+### Stage 9 — Result (`src/pages/result_page.py`)
+- Displays the final rendered video in a player with play/pause, seek,
+  and volume controls, alongside the agent's markdown summary report
+  (from `edit_plan.notes`, rendered as HTML — not raw JSON).
+- Auto-navigated to from Stage 8 only when a video file exists in
+  `.llama-cut/video/output/`. Also reachable via the sidebar.
+- Video discovery: `find_rendered_video()` in `src/video_production.py`
+  scans `video/output/` for the newest `.mp4` (by mtime). The worker also
+  populates `edit_plan.output_path` post-render for a direct reference.
+- Output: read-only view of the rendered video + report; no files written.
 
 ## Stage 8 — Final Video Production (V1 philosophy)
 

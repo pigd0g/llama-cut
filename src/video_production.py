@@ -2346,6 +2346,23 @@ def clear_production(working_folder: str) -> None:
     shutil.rmtree(d, ignore_errors=True)
 
 
+def find_rendered_video(working_folder: str) -> Path | None:
+    """Find the most recently rendered final video in .llama-cut/video/output/.
+
+    Returns the newest .mp4 path (by modification time), or None if the
+    directory is empty or missing.
+    """
+    out_dir = _video_dir(working_folder) / OUTPUT_SUBDIR
+    if not out_dir.exists():
+        return None
+    videos = sorted(
+        out_dir.glob("*.mp4"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return videos[0] if videos else None
+
+
 # --- VideoProductionSettings --------------------------------------------------
 
 from dataclasses import dataclass as dc_dataclass, asdict
