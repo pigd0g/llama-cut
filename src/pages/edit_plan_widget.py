@@ -15,13 +15,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QEvent
 from PyQt6.QtGui import QFontMetrics, QPixmap
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
     QScrollArea,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -207,6 +208,20 @@ class _BeatCard(QFrame):
             }}
         """)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
+
+        # Build the full text shown in the tooltip on hover. We use
+        # QToolTip.showText() in enterEvent instead of setToolTip() because
+        # the frame's child widgets and stylesheet interfere with Qt's
+        # built-in tooltip delivery on hover.
+        annotation = self._annotation_text()
+        time_range = f"{self._beat.source_start:.1f}-{self._beat.source_end:.1f}s"
+        self._tooltip_text = (
+            f"{self._beat.id}\n"
+            f"{annotation}\n"
+            f"Source: {self._beat.source}\n"
+            f"Range: {time_range}"
+        )
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(SPACING_SM, SPACING_SM, SPACING_SM, SPACING_SM)
@@ -214,8 +229,7 @@ class _BeatCard(QFrame):
 
         # Annotation zone (top): wrap to multiple lines but truncate to a
         # char budget with an ellipsis so long descriptions don't grow the
-        # card unbounded. The full text is shown in the tooltip on hover.
-        annotation = self._annotation_text()
+        # card unbounded. The full text is shown in the card tooltip on hover.
         truncated = self._truncate(annotation, _ANN_CHAR_LIMIT)
         ann_label = QLabel(truncated)
         ann_label.setWordWrap(True)
@@ -224,7 +238,6 @@ class _BeatCard(QFrame):
             f"background: transparent; border: none; padding: 0;"
         )
         ann_label.setFixedHeight(_ANN_HEIGHT)
-        ann_label.setToolTip(annotation)
         lay.addWidget(ann_label)
 
         # Thumbnail (middle, 16:9)
@@ -240,8 +253,7 @@ class _BeatCard(QFrame):
         lay.addWidget(self._thumb_label)
 
         # Beat id + source + time range (bottom): truncate the source name
-        # with an ellipsis; full source shown in the tooltip on hover.
-        time_range = f"{self._beat.source_start:.1f}-{self._beat.source_end:.1f}s"
+        # with an ellipsis; full details shown in the card tooltip on hover.
         src_trunc = self._truncate(self._beat.source, _INFO_CHAR_LIMIT)
         info_label = QLabel(
             f"<b>{self._elide_html(self._beat.id, 20)}</b><br>"
@@ -252,9 +264,6 @@ class _BeatCard(QFrame):
         )
         info_label.setStyleSheet("background: transparent; border: none; padding: 0;")
         info_label.setFixedHeight(_INFO_HEIGHT)
-        info_label.setToolTip(
-            f"{self._beat.id}\n{self._beat.source}\n{time_range}"
-        )
         lay.addWidget(info_label)
 
     @staticmethod
@@ -306,9 +315,29 @@ class _BeatCard(QFrame):
         self.clicked.emit(True)
         super().mousePressEvent(event)
 
+    def enterEvent(self, event) -> None:
+        """Show the full beat text as a tooltip when the mouse enters the card.
+
+        Uses QToolTip.showText() directly because setToolTip() on the frame
+        does not reliably fire — the frame's child widgets and stylesheet
+        interfere with Qt's built-in hover-tooltip delivery.
+        """
+        tip = getattr(self, "_tooltip_text", "")
+        if tip:
+            QToolTip.showText(event.globalPosition().toPoint(), tip, self)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        """Hide the tooltip when the mouse leaves the card."""
+        QToolTip.hideText()
+        super().leaveEvent(event)
+
 
 class _TransitionPill(QFrame):
     """A rounded pill between two beats showing the transition type."""
+
+    # Solid green background with white text per the design spec.
+    _GREEN = "#22c55e"
 
     def __init__(self, transition_type: str, duration: float = 0.0, parent=None):
         super().__init__(parent)
@@ -317,7 +346,7 @@ class _TransitionPill(QFrame):
             label_text = f"{transition_type} {duration:.1f}s"
         lbl = QLabel(label_text)
         lbl.setStyleSheet(
-            f"color: {COLOR_PRIMARY}; font-size: 11px; font-weight: 600; "
+            f"color: #ffffff; font-size: 11px; font-weight: 600; "
             f"background: transparent; border: none;"
         )
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -327,8 +356,8 @@ class _TransitionPill(QFrame):
         lay.addWidget(lbl)
         self.setStyleSheet(f"""
             _TransitionPill {{
-                background-color: {COLOR_PRIMARY}22;
-                border: 1px solid {COLOR_PRIMARY}66;
+                background-color: {self._GREEN};
+                border: none;
                 border-radius: {RADIUS_FULL}px;
                 min-height: 24px;
                 max-height: 24px;

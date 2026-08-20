@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..edit_plan_executor import EditPlanExecutor, render_command_as_string
+from ..video_production import load_tool_log
 from ..theme import (
     COLOR_BORDER,
     COLOR_ON_SURFACE,
@@ -192,6 +193,62 @@ class DebugPlanDialog(QDialog):
             cmds_lay.addWidget(empty)
 
         tabs.addTab(cmds_tab, f"FFmpeg Commands ({len(self._plan.commands) if self._plan else 0})")
+
+        # Tab 3: Execution Log (commands that actually ran + their output/errors)
+        log_tab = QWidget()
+        log_lay = QVBoxLayout(log_tab)
+        log_lay.setContentsMargins(SPACING_MD, SPACING_MD, SPACING_MD, SPACING_MD)
+        log_lay.setSpacing(SPACING_SM)
+
+        exec_log = load_tool_log(self._working_folder) if self._working_folder else []
+
+        log_edit = QPlainTextEdit()
+        log_edit.setReadOnly(True)
+        log_edit.setFont(mono)
+        log_edit.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background-color: {COLOR_SURFACE};
+                color: {COLOR_ON_SURFACE};
+                border: 1px solid {COLOR_BORDER};
+                border-radius: {RADIUS_MD}px;
+                padding: {SPACING_SM}px;
+            }}
+        """)
+        if exec_log:
+            lines: list[str] = []
+            for entry in exec_log:
+                status = entry.get("status", "?")
+                marker = "[OK]" if status == "done" else ("[SKIP]" if status == "skipped" else "[FAIL]")
+                lines.append(f"{'=' * 78}")
+                lines.append(f"{marker} {entry.get('id', '?')} ({entry.get('type', '?')}) — {status}  ({entry.get('duration_s', 0)}s)")
+                beat = entry.get("beat_id")
+                if beat:
+                    lines.append(f"  beat: {beat}")
+                lines.append(f"  command: {entry.get('command', '')}")
+                if entry.get("output_path"):
+                    lines.append(f"  output: {entry.get('output_path', '')}")
+                if entry.get("error"):
+                    lines.append(f"  ERROR: {entry.get('error', '')}")
+                if entry.get("stderr"):
+                    stderr = entry.get("stderr", "")
+                    # Show up to 1500 chars of stderr to keep the log readable.
+                    if len(stderr) > 1500:
+                        stderr = stderr[:1500] + "\n  ... (truncated)"
+                    lines.append(f"  stderr:")
+                    for sl in stderr.splitlines():
+                        lines.append(f"    {sl}")
+                lines.append("")
+            log_edit.setPlainText("\n".join(lines))
+        else:
+            log_edit.setPlainText("No commands have been executed yet. Run the edit plan to populate this log.")
+        log_lay.addWidget(log_edit)
+
+        copy_log_btn = QPushButton("Copy Log")
+        copy_log_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        _log_text = log_edit.toPlainText()
+        copy_log_btn.clicked.connect(lambda: QApplication.clipboard().setText(_log_text))
+        log_lay.addWidget(copy_log_btn)
+        tabs.addTab(log_tab, f"Execution Log ({len(exec_log)})")
 
         root.addWidget(tabs, 1)
 

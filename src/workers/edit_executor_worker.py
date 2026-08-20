@@ -25,7 +25,9 @@ from ..video_production import (
     EditPlan,
     find_rendered_video,
     save_edit_plan,
+    save_tool_log,
 )
+from ..edit_plan_executor import render_command_as_string
 
 
 class EditExecutorWorker(QThread):
@@ -72,6 +74,10 @@ class EditExecutorWorker(QThread):
 
         success, failed_result, all_results = self._executor.run()
 
+        # Persist the ffmpeg execution log (command line + output + errors
+        # for every command that ran) so the Debug modal can show it.
+        self._persist_exec_log(all_results)
+
         if self._cancel:
             self._plan.status = "draft"
             save_edit_plan(self._working_folder, self._plan)
@@ -115,6 +121,37 @@ class EditExecutorWorker(QThread):
         save_edit_plan(self._working_folder, self._plan)
         self.log.emit("Edit plan execution complete.")
         self.finished_success.emit(self._plan)
+
+    def _persist_exec_log(self, results: list) -> None:
+        """Save a plain-text ffmpeg execution log to tool_log.json.
+
+        Each entry records the command id, type, status, the rendered ffmpeg
+        command line, the output path, the error (if any), and the stderr
+        excerpt. The Debug modal loads this to show what actually ran.
+        """
+        ex = self._executor
+        log: list[dict] = []
+        for r in results:
+            cmd = r.command
+            try:
+                cmd_str = render_command_as_string(cmd, ex)
+            except Exception:
+                cmd_str = f"# {cmd.type} ({cmd.id})"
+            log.append({
+                "id": cmd.id,
+                "type": cmd.type,
+                "beat_id": cmd.beat_id,
+                "status": "skipped" if r.skipped else ("done" if r.success else "failed"),
+                "command": cmd_str,
+                "output_path": r.output_path or "",
+                "error": r.error or "",
+                "stderr": r.stderr or "",
+                "duration_s": round(r.duration_s, 2),
+            })
+        try:
+            save_tool_log(self._working_folder, log)
+        except Exception:
+            pass
 
     def _on_progress(self, p: ExecutorProgress) -> None:
         self.progress.emit(p)
