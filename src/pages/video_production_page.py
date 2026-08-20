@@ -300,6 +300,29 @@ class VideoProductionPage(QWidget):
         title.setProperty("class", "headline-sm")
         lay.addWidget(title)
 
+        # Status line (plan lifecycle: draft → executing → rendered → verified)
+        if self._edit_plan is not None and self._edit_plan.status:
+            status = self._edit_plan.status
+        else:
+            status = "draft"
+        self._edit_plan_status_label = QLabel(f"Status: {status}")
+        self._edit_plan_status_label.setProperty("class", "label-sm")
+        self._edit_plan_status_label.setStyleSheet(f"color: {COLOR_ON_SURFACE_VARIANT};")
+        lay.addWidget(self._edit_plan_status_label)
+
+        # Per-shot traceability table (rendered as HTML) — placed above the
+        # raw JSON so the structured plan is easy to scan at a glance.
+        if self._edit_plan is not None and self._edit_plan.timeline:
+            self.traceability_browser = self._make_text_browser(
+                _build_traceability_html(self._edit_plan)
+            )
+        else:
+            self.traceability_browser = self._make_text_browser(
+                "<i>No shots in the plan yet.</i>"
+            )
+        lay.addWidget(self.traceability_browser)
+
+        # Raw JSON (kept for power users / debugging).
         if self._edit_plan is not None:
             plan_json = self._edit_plan.model_dump_json(indent=2)
         else:
@@ -341,6 +364,8 @@ class VideoProductionPage(QWidget):
             self.browser._adjust_height()
         if hasattr(self, "tool_log_browser") and self.tool_log_browser is not None and not sip.isdeleted(self.tool_log_browser):
             self.tool_log_browser._adjust_height()
+        if hasattr(self, "traceability_browser") and self.traceability_browser is not None and not sip.isdeleted(self.traceability_browser):
+            self.traceability_browser._adjust_height()
         if hasattr(self, "edit_plan_browser") and self.edit_plan_browser is not None and not sip.isdeleted(self.edit_plan_browser):
             self.edit_plan_browser._adjust_height()
         min_h = self._content_layout.minimumSize().height()
@@ -475,3 +500,57 @@ class VideoProductionPage(QWidget):
 
 def _escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _build_traceability_html(edit_plan) -> str:
+    """Render the edit plan's timeline as a per-shot traceability table.
+
+    Columns: Shot | Scene | Source | Start–End | Clip | Purpose.
+    Placed above the raw JSON in the Edit Plan card so the structured plan
+    is easy to scan at a glance.
+    """
+    rows = []
+    for item in edit_plan.timeline:
+        start_end = (
+            f"{item.source_start:.1f}–{item.source_end:.1f}s"
+            if item.source_start is not None and item.source_end is not None
+            else "—"
+        )
+        scene = _escape_html(item.storyboard_scene or item.storyboard_shot or "")
+        purpose = _escape_html(item.purpose or "")
+        clip = _escape_html(item.intermediate_clip or "")
+        src = _escape_html(item.source or "")
+        shot_id = _escape_html(item.id or "")
+        rows.append(
+            "<tr>"
+            f"<td><b>{shot_id}</b></td>"
+            f"<td>{scene}</td>"
+            f"<td>{src}</td>"
+            f"<td>{start_end}</td>"
+            f"<td>{clip}</td>"
+            f"<td>{purpose}</td>"
+            "</tr>"
+        )
+    if not rows:
+        return "<i>No shots in the plan.</i>"
+    header = (
+        "<tr>"
+        "<th align='left'>Shot</th>"
+        "<th align='left'>Scene</th>"
+        "<th align='left'>Source</th>"
+        "<th align='left'>Start–End</th>"
+        "<th align='left'>Clip</th>"
+        "<th align='left'>Purpose</th>"
+        "</tr>"
+    )
+    style = (
+        "table { border-collapse: collapse; width: 100%; }"
+        "th, td { padding: 4px 8px; border-bottom: 1px solid #2a3344; "
+        "vertical-align: top; text-align: left; }"
+        "th { font-weight: 600; }"
+    )
+    return (
+        f"<style>{style}</style>"
+        f"<p><b>{len(rows)} shot(s)</b> · status: {_escape_html(edit_plan.status or 'draft')}</p>"
+        f"<table>{header}{''.join(rows)}</table>"
+    )

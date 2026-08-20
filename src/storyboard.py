@@ -88,6 +88,20 @@ Only recommend background music if the user explicitly requests it.
 If important information about the desired video format, design, content, audience, duration, platform, or creative direction is genuinely missing and prevents you from producing a good storyboard, ask the user a concise question.
 
 Otherwise, make sensible creative decisions based on the user's brief and the available context.
+
+## Editor Capabilities Awareness
+
+The storyboard you produce will be executed by an automated video editor. \
+A description of the editor's practical capabilities and constraints is \
+provided in the Available Context. Your storyboard must stay within those \
+capabilities so it is practical to implement.
+
+Crucially, the storyboard itself must be written in plain English. Never \
+reference tools, function names, or technical operations. Describe the \
+creative intent — what the audience should see and hear — and reference \
+source footage by exact filename and approximate timestamp range where \
+the context supports it. Do not invent footage or timestamps that the \
+provided context does not support.
 """
 
 
@@ -271,16 +285,22 @@ def build_generation_prompt(brief: str, context_md: str) -> str:
     The system prompt (STORYBOARD_SYSTEM_PROMPT) is sent as a separate
     ``system`` role message in the chat call; this function returns only the
     user-role content.
+
+    Includes an Editor Capabilities block so the storyboard stays practical
+    to implement (the block is plain English and contains no tool names).
     """
+    from .editor_capabilities import capabilities_block
     return (
         f"## Creative Brief\n\n{brief.strip()}\n\n"
         f"## Available Context\n\n{context_md.strip()}\n\n"
+        f"{capabilities_block()}\n\n"
         f"## Task\n\n"
         f"Develop a detailed storyboard based on the creative brief and the "
         f"available context. Follow the structure described in your "
         f"instructions. Reference source videos and timestamps where the "
         f"context supports them. Do not invent footage that is not in the "
-        f"context. Return the complete storyboard as Markdown."
+        f"context. Return the complete storyboard as Markdown. Keep it in "
+        f"plain English and do not reference tools or technical operations."
     )
 
 
@@ -292,17 +312,22 @@ def build_refinement_prompt(new_prompt: str, existing_storyboard: str,
     full context so the LLM can validate and improve source selections.
     The refinement instructions (REFINEMENT_INSTRUCTIONS) are included here
     so the model treats the new prompt as a refinement, not a fresh start.
+
+    Also includes the Editor Capabilities block so refinements stay practical.
     """
+    from .editor_capabilities import capabilities_block
     return (
         f"{REFINEMENT_INSTRUCTIONS.strip()}\n\n"
         f"## Existing Storyboard\n\n{existing_storyboard.strip()}\n\n"
         f"## User's New Instruction\n\n{new_prompt.strip()}\n\n"
         f"## Available Context\n\n{context_md.strip()}\n\n"
+        f"{capabilities_block()}\n\n"
         f"## Task\n\n"
         f"Apply the user's new instruction to refine the existing storyboard. "
         f"Preserve good decisions from the existing storyboard unless the "
         f"user's instruction requires them to change. Return the complete "
-        f"revised storyboard as Markdown."
+        f"revised storyboard as Markdown. Keep it in plain English and do not "
+        f"reference tools or technical operations."
     )
 
 

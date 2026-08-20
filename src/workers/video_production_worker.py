@@ -32,6 +32,7 @@ from ..video_production import (
     build_refinement_prompt,
     build_ollama_client,
     is_config_valid,
+    load_edit_plan,
     load_video_production_config,
     run_editing_agent,
     save_edit_plan,
@@ -186,7 +187,7 @@ class VideoProductionWorker(QThread):
         tools = registry.get_tools()
         self.log.emit(f"Built {len(tools)} tools.")
 
-        # --- Phase 6: Run agent loop ---
+        # --- Phase 6: Run agent loop (two-phase: plan → execute) ---
         self.progress.emit("Running editing agent...")
 
         def _is_cancelled() -> bool:
@@ -197,7 +198,7 @@ class VideoProductionWorker(QThread):
             model=config.model,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            tools=tools,
+            registry=registry,
             progress_cb=lambda msg: self.progress.emit(msg),
             log_cb=lambda msg: self.log.emit(msg),
             is_cancelled=_is_cancelled,
@@ -210,19 +211,32 @@ class VideoProductionWorker(QThread):
         self.log.emit(f"Agent finished. {len(tool_log)} tool calls made.")
         self.log.emit(f"Agent response: {final_text[:200]}...")
 
-        # --- Phase 7: Build + persist edit plan ---
+        # --- Phase 7: Persist edit plan + tool log ---
         self.progress.emit("Saving edit plan...")
         history = load_history(self._working_folder)
         storyboard_version = history.latest.version if history.latest else 0
 
-        edit_plan = build_edit_plan_from_tool_log(
-            tool_log,
-            storyboard_version=storyboard_version,
-        )
-        edit_plan.notes = final_text
-        edit_plan.preset = self._render_preset
+        # Primary path: the agent committed a plan during the run (it is
+        # already persisted to disk by commit_edit_plan / update_edit_plan).
+        # Reload it from disk so we capture the latest state (including any
+        # update_edit_plan amendments). Fall back to reconstructing from the
+        # tool log only if the agent never committed a plan.
+        edit_plan = load_edit_plan(self._working_folder)
+        if edit_plan is None:
+            edit_plan = build_edit_plan_from_tool_log(
+                tool_log,
+                storyboard_version=storyboard_version,
+            )
+            edit_plan.notes = final_text
+            edit_plan.preset = self._render_preset
+            save_edit_plan(self._working_folder, edit_plan)
+        else:
+            # Keep the committed plan authoritative; just record notes/preset.
+            edit_plan.notes = final_text
+            if self._render_preset:
+                edit_plan.preset = self._render_preset
+            save_edit_plan(self._working_folder, edit_plan)
 
-        save_edit_plan(self._working_folder, edit_plan)
         save_tool_log(self._working_folder, tool_log)
         self.log.emit("Saved edit plan and tool log.")
 

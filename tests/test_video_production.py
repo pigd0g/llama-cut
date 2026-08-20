@@ -578,9 +578,14 @@ def test_assemble_timeline_with_transitions(registry, tmp_working):
     assert data.get("transitions") == 2
 
 
-# --- Agent loop --------------------------------------------------------------
+# --- Agent loop ---------------------------------------------------------------
 
-def test_agent_loop_no_tool_calls():
+def _loop_registry(tmp_path: Path) -> ToolRegistry:
+    """A minimal ToolRegistry for the agent loop tests (no source videos)."""
+    return ToolRegistry(str(tmp_path), [], [])
+
+
+def test_agent_loop_no_tool_calls(tmp_path):
     """Agent responds with text only — loop runs once."""
     mock_client = MagicMock()
     mock_msg = MagicMock()
@@ -589,13 +594,14 @@ def test_agent_loop_no_tool_calls():
     mock_client.chat.return_value = MagicMock(message=mock_msg)
 
     final_text, tool_log = run_editing_agent(
-        mock_client, "model", "system", "user", tools=[],
+        mock_client, "model", "system", "user",
+        registry=_loop_registry(tmp_path),
     )
     assert final_text == "Done editing."
     assert tool_log == []
 
 
-def test_agent_loop_one_tool_then_done():
+def test_agent_loop_one_tool_then_done(tmp_path):
     """Agent calls one tool, then responds with text."""
     mock_client = MagicMock()
     call_count = [0]
@@ -615,19 +621,24 @@ def test_agent_loop_one_tool_then_done():
 
     mock_client.chat.side_effect = chat_side_effect
 
-    def fake_tool(video_path: str) -> dict:
+    registry = _loop_registry(tmp_path)
+    # probe_video is a phase-1 tool; patch it so it succeeds without ffprobe.
+    # The replacement must keep __name__ == "probe_video" so _execute_tool_call
+    # can dispatch to it by name.
+    def probe_video(video_path: str) -> dict:
         return {"filename": video_path}
+    registry.probe_video = probe_video  # type: ignore[assignment]
 
     final_text, tool_log = run_editing_agent(
         mock_client, "model", "system", "user",
-        tools=[fake_tool],
+        registry=registry,
     )
     assert final_text == "Finished."
     assert len(tool_log) == 1
     assert tool_log[0]["tool"] == "probe_video"
 
 
-def test_agent_loop_exhaustion():
+def test_agent_loop_exhaustion(tmp_path):
     """Agent keeps calling tools until the limit is reached."""
     mock_client = MagicMock()
     msg = MagicMock()
@@ -637,13 +648,60 @@ def test_agent_loop_exhaustion():
     msg.content = ""
     mock_client.chat.return_value = MagicMock(message=msg)
 
+    registry = _loop_registry(tmp_path)
+    # Replacement must keep __name__ == "probe_video" for tool dispatch.
+    def probe_video(**kw) -> dict:
+        return {"ok": True}
+    registry.probe_video = probe_video  # type: ignore[assignment]
+
     final_text, tool_log = run_editing_agent(
         mock_client, "model", "system", "user",
-        tools=[lambda **kw: {"ok": True}],
+        registry=registry,
         log_cb=lambda s: None,
     )
     assert "exhausted" in final_text.lower() or "did not complete" in final_text.lower()
     assert len(tool_log) == MAX_AGENT_ROUND_TRIPS
+
+
+def test_agent_loop_detects_tool_failure(tmp_path):
+    """A tool returning a ToolResult failure is recorded as success=False in
+    the tool log and the error is visible (not double-wrapped). This guards
+    against the regression where to_tool_message() dicts were passed straight
+    through, causing every failure to log as OK."""
+    mock_client = MagicMock()
+    call_count = [0]
+
+    def chat_side_effect(**kwargs):
+        call_count[0] += 1
+        msg = MagicMock()
+        if call_count[0] == 1:
+            mock_call = MagicMock()
+            mock_call.function.name = "probe_video"
+            mock_call.function.arguments = {"video_path": "missing.mp4"}
+            msg.tool_calls = [mock_call]
+            msg.content = ""
+        else:
+            msg.tool_calls = None
+            msg.content = "Done."
+        return MagicMock(message=msg)
+
+    mock_client.chat.side_effect = chat_side_effect
+    registry = _loop_registry(tmp_path)
+    # Use the real probe_video, which returns a ToolResult failure for an
+    # unknown source (no ffprobe needed — it rejects before probing).
+    final_text, tool_log = run_editing_agent(
+        mock_client, "model", "system", "user",
+        registry=registry,
+    )
+    assert len(tool_log) == 1
+    assert tool_log[0]["tool"] == "probe_video"
+    # The failure must be detected (was always True before the fix).
+    assert tool_log[0]["success"] is False
+    # The error text must be present and readable, not double-wrapped JSON.
+    result = tool_log[0]["result"]
+    assert isinstance(result, dict)
+    assert "error" in result
+    assert "not a selected source video" in result["error"]
 
 
 # --- Prompt building --------------------------------------------------------
@@ -751,7 +809,11 @@ def test_build_edit_plan_from_tool_log():
     plan = build_edit_plan_from_tool_log(log, storyboard_version=2)
     assert plan.storyboard_version == 2
     assert len(plan.timeline) == 2
-    assert plan.timeline[0].id == "shot_01"
+    # The fallback builder now uses the clip's output_name as the id so each
+    # plan item is traceable to its generated clip (matching the proactive
+    # plan-then-execute contract).
+    assert plan.timeline[0].id == "clip1"
+    assert plan.timeline[0].intermediate_clip == "clip1"
     assert plan.timeline[0].source == "A.mp4"
     assert plan.timeline[0].source_start == 0
     assert plan.timeline[1].source_start == 10
@@ -772,7 +834,7 @@ def test_build_edit_plan_from_tool_log_skips_errors():
 # --- Constants ---------------------------------------------------------------
 
 def test_max_agent_round_trips_is_reasonable():
-    assert MAX_AGENT_ROUND_TRIPS == 50
+    assert MAX_AGENT_ROUND_TRIPS == 150
 
 
 def test_supported_transitions_includes_common():

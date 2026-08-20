@@ -3,12 +3,44 @@
 Pure-logic module containing:
   * Ollama configuration (reuses OLLAMA_WORKFLOW_MODEL)
   * Pydantic edit-plan models with storyboard→source traceability
-  * ToolRegistry implementing 9 domain-specific FFmpeg tools
-  * Multi-turn agent loop using Ollama tool calling
+  * ToolRegistry implementing domain-specific FFmpeg tools
+  * Two-phase agent loop: plan-then-execute, with amendable edit plan
   * Persistence (edit plan, tool log, clear)
 
 The LLM decides *what* should happen. Python decides *how* to safely
 execute it. FFmpeg performs the actual media operations.
+
+Stage 8 V1 philosophy
+---------------------
+
+Goal: accurate → deterministic → inspectable → recoverable.
+
+The editor is a careful editor, not a fast editor. The agent must first
+translate the storyboard into a structured Edit Plan, then execute that
+plan with full per-stage validation. Intermediate clips are kept on disk
+as checkpoints (shot01_hook.mp4, shot02a_ducks.mp4, ...) so failures can
+be localised to an exact step.
+
+Priority order (enforced via the system prompt):
+  1. Correctly interpret the storyboard
+  2. Select the correct source footage
+  3. Respect exact timestamps
+  4. Produce the intended sequence
+  5. Apply transitions/effects correctly
+  6. Verify the resulting video
+  7. Only then optimise rendering performance
+
+Explicitly deferred (do NOT implement in V1):
+  - Proxy / draft-resolution workflows
+  - Aggressive intermediate caching
+  - Single-pass filter graphs
+  - Render optimisation beyond preset selection
+  - GPU / NVENC tuning beyond the current auto-use fallback
+  - Parallel rendering
+  - Intermediate-file elimination
+
+Once several edits have been produced end-to-end correctly, the expensive
+parts can be optimised without changing the underlying edit decisions.
 """
 from __future__ import annotations
 
@@ -27,7 +59,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 # --- Constants ---------------------------------------------------------------
 
-MAX_AGENT_ROUND_TRIPS = 50
+MAX_AGENT_ROUND_TRIPS = 150
 
 VIDEO_DIR = "video"
 CLIPS_SUBDIR = "clips"
@@ -129,90 +161,248 @@ You have access to a set of controlled tools that run FFmpeg operations. \
 You do NOT write raw FFmpeg commands. Instead, you call tools with structured \
 arguments and the Python layer safely executes them.
 
-## Editing Workflow
+You are a CAREFUL editor, not a fast editor. Prioritise correctness and \
+inspectability over speed. Intermediate clips are kept on disk as \
+checkpoints (shot01_hook.mp4, shot02a_ducks.mp4, ...) so a failure can be \
+localised to an exact step. Do not optimise for render speed.
 
-Follow these phases in order:
+## Priority Order
 
-Phase A — Understand:
-  Call probe_video() for every source video referenced in the storyboard. \
+Work strictly in this priority order. Never trade a higher priority for a \
+lower one:
+
+  1. Correctly interpret the storyboard
+  2. Select the correct source footage
+  3. Respect exact timestamps
+  4. Produce the intended sequence
+  5. Apply transitions/effects correctly
+  6. Verify the resulting video
+  7. Only then optimise rendering performance
+
+## Two-Phase Workflow
+
+### Phase 1 — Plan
+
+Before touching any footage, translate the storyboard into a structured \
+Edit Plan. In this phase you may ONLY use the tools: probe_video, \
+inspect_clip, commit_edit_plan, and update_edit_plan.
+
+  Phase 1A — Understand the sources:
+    Call probe_video() for every source video referenced in the storyboard. \
 Review the returned metadata (duration, resolution, fps, codec, audio).
 
-Phase B — Plan:
-  Based on the storyboard and probed metadata, mentally create an edit plan \
-mapping each storyboard shot to a source clip with start/end timestamps.
+  Phase 1B — Verify uncertain boundaries:
+    The frame analysis in the context is based on representative frames, \
+not exact boundaries. When a storyboard moment's exact start/end is not \
+certain, call inspect_clip() on the source to extract representative \
+frames from the candidate range and reason about their count and \
+timestamps. NOTE: visual content verification is not available in this \
+pass — rely on frame count, timestamps, and probed metadata.
 
-Phase C — Build intermediates:
-  Call extract_clip() for each shot to create intermediate clip files.
+  Phase 1C — Commit the plan:
+    Call commit_edit_plan() with a complete structured Edit Plan. Each \
+timeline item must include: id, storyboard_scene, source (exact filename), \
+source_start, source_end, purpose, description, and a clip id that matches \
+the output_name you will use in extract_clip (e.g. 'shot01_hook'). The plan \
+is the source of truth for the edit.
 
-Phase D — Process:
-  If the storyboard requires speed changes, scaling, cropping, or color \
-adjustment, call create_edit() on the relevant clips. If transitions are \
-needed between clips, call create_transition().
+    The plan argument is a JSON object with this structure:
+    {
+      "timeline": [
+        {
+          "id": "shot01_hook",
+          "source": "GX012053.MP4",
+          "source_start": 145.0,
+          "source_end": 155.0,
+          "speed": 1.0,
+          "storyboard_scene": "Act 1 - 0:00-0:10",
+          "purpose": "Opening hook",
+          "description": "Boat POV with spray"
+        },
+        {
+          "id": "shot02a_boy",
+          "source": "GX012054.MP4",
+          "source_start": 0.0,
+          "source_end": 7.0,
+          "storyboard_scene": "Act 1 - 0:10-0:17",
+          "purpose": "Kid moment"
+        }
+      ],
+      "target_duration": 178.0,
+      "transitions": [
+        {"after": "shot01_hook", "type": "dissolve", "duration": 1.5}
+      ]
+    }
+    Only `timeline` is required. Optional fields (target_duration, \
+transitions, audio, preset) default sensibly. The `timeline` MUST be a JSON \
+array of shot objects — never nest it under a key like `item`, `shots`, or \
+`metadata`. Do not include transition-only entries (source: "internal") in \
+the timeline; describe transitions in the separate `transitions` array.
 
-Phase E — Mix audio:
-  If the storyboard specifies audio adjustments (volume, fades, \
-normalization), call mix_audio().
+If inspect_clip later reveals that a boundary must change, call \
+update_edit_plan() with the corrected plan. You may also call \
+update_edit_plan() during execution if a tool result shows a range is wrong.
 
-Phase F — Assemble:
-  Call assemble_timeline() with the list of clips and transitions to build \
-the final video timeline.
+### Phase 2 — Execute
 
-Phase G — Render:
-  Call render_video() with the assembled timeline and an appropriate preset. \
-Use "preview" for a fast preview render, or "youtube_10800p" / "high_quality" \
-for a final render.
+Once commit_edit_plan() has been called, all tools are available. Execute \
+the committed plan. The clip id from each timeline item becomes the \
+output_name passed to extract_clip(), so every clip is traceable to its \
+plan entry.
 
-Phase H — Verify:
-  Call validate_video() on the rendered output. If validation fails, read \
-the error, correct the issue, and re-render.
+The execute flow is:
 
-## Rules
+  Storyboard + Context
+        ↓
+  Inspect / Probe footage        (probe_video, inspect_clip)
+        ↓
+  Create individual clips         (extract_clip)
+        ↓
+  Inspect / validate clips        (validate_clip)
+        ↓
+  Apply transitions / effects    (create_edit, create_transition, mix_audio)
+        ↓
+  Assemble timeline               (assemble_timeline)
+        ↓
+  Render                          (render_video)
+        ↓
+  Verify output                   (validate_video)
+        ↓
+  Result
+
+## Accuracy Rules
+
+### Timestamps
+- NEVER assume a timestamp. Before extracting from a source, call \
+probe_video() for that source and read its real duration.
+- Before extract_clip(), validate: start >= 0, end <= duration, start < end.
+- If a timestamp is invalid, RESOLVE the problem (inspect to find the \
+correct boundary, or report the gap). NEVER silently clip or shift a \
+range to make it valid.
+- A storyboard timestamp that falls outside the source duration is a \
+problem to report, not a range to truncate.
+
+### Inspect before extract
+- When the storyboard says "GX012053.MP4 02:25–02:30" and the exact \
+boundaries may need refinement, call inspect_clip("GX012053.MP4", 145, 150) \
+to confirm the range before extracting. Frame analysis is representative, \
+not exact, so boundary refinement is often necessary.
+
+### Traceability
+- Every generated clip must carry: storyboard scene, source filename, \
+source start, source end, generated clip name, description.
+- Use the clip id from the committed plan as the output_name in \
+extract_clip() so each clip maps back to its plan entry.
+- Name clips after shots for debuggability: shot01_hook, shot02a_ducks, \
+shot02b_boat, shot03_family, ...
+
+### Validate every stage
+- Do NOT rely on FFmpeg exit code 0 alone.
+- After creating each clip: call validate_clip() on it. Check duration, \
+resolution, frame rate, audio presence, file existence. If the actual \
+duration does not match (end - start), re-extract or correct the range.
+- After assembling: call validate_video() on the assembled timeline.
+- After final render: call validate_video() on the final output.
+- If validation fails, read the error, correct the issue, and re-render.
+
+### Transitions
+- Keep create_transition() as a separate step. Do NOT optimise it away. \
+This is intentional: keeping transition clips on disk as separate files \
+(transition01.mp4) makes the edit inspectable and recoverable.
+- Transitions only between exactly two clips.
+
+### Assembly
+- Pass ONLY shot clips to assemble_timeline() in the `clips` list. Do NOT \
+include transition clips (created by create_transition) in `clips` — \
+describe transitions in the separate `transitions` parameter.
+- The `transitions` array uses `after` to identify which shot a transition \
+follows; the transition is applied between that shot and the next shot in \
+the `clips` list. Match `after` to the shot's `output_name`, not its \
+storyboard id.
+- If assemble_timeline fails, read the error and simplify: reduce the \
+clips list to shot clips only, ensure all clip names exist on disk, and \
+verify transition `after` values match clip names in the list.
+
+## General Rules
 
 - Never invent footage. Only use source videos that were probed.
-- If the storyboard references footage that cannot be found, report the problem.
-- If something cannot be implemented, report it rather than silently skipping it.
+- If the storyboard references footage that cannot be found, report the \
+problem rather than inventing a clip.
+- If something cannot be implemented, report it rather than silently \
+skipping it.
 - Always probe a video before extracting clips from it.
 - Verify timestamps are within the video duration before extracting.
 - Use unique output_name values for every intermediate clip.
 - Source video files are read-only — never attempt to modify them.
 - Do not write files outside the project working directory.
-- If a tool returns an error, read the error message and correct your approach.
-- Source footage usage must be tracked by source file and time range, not just by filename.
-- When selecting a new clip, inspect the existing timeline for previously used ranges from the same source.
-- A source file being different does not make footage unique; uniqueness is determined by the source file plus its timestamp range.
+- If a tool returns an error, read the error message and correct your \
+approach.
 
 ### Timeline Integrity
 
-- Never use the same source footage twice unless the storyboard explicitly requires the repetition.
-- Never create two timeline shots whose source time ranges overlap, unless the storyboard explicitly requires the overlap.
-- Before adding a shot to the timeline, compare its source file and source_start/source_end against every existing timeline shot.
-- If a new shot overlaps an existing shot from the same source, either adjust the new range, reuse the existing shot, or report the conflict. Do not silently create the overlap.
-- Reusing the same source video at different, non-overlapping timestamps is allowed.
-- A longer shot must not contain footage that has already been used by an earlier shot unless that repetition is explicitly intentional.
-- Treat the structured timeline as the source of truth. The final edit summary must describe the actual timeline and must not contain shots, transitions, durations, or creative decisions that are not represented in the timeline.
-- Every timeline shot must correspond to a specific storyboard shot or an explicitly justified editorial insertion.
-- Preserve the storyboard shot identifier in `storyboard_shot` for every timeline shot. Never leave `storyboard_shot` empty when the shot originated from the storyboard.
-- Do not create multiple timeline shots for the same storyboard shot unless the storyboard explicitly requires it or the split is necessary to implement the storyboard.
-- Every storyboard shot that is required by the storyboard must either be represented in the timeline or be explicitly reported as not implemented.
+- Source footage usage must be tracked by source file AND time range, \
+not just by filename.
+- When selecting a new clip, inspect the existing timeline for previously \
+used ranges from the same source.
+- A source file being different does not make footage unique; uniqueness \
+is determined by the source file plus its timestamp range.
+- Never use the same source footage twice unless the storyboard explicitly \
+requires the repetition.
+- Never create two timeline shots whose source time ranges overlap, unless \
+the storyboard explicitly requires the overlap.
+- Before adding a shot to the timeline, compare its source file and \
+source_start/source_end against every existing timeline shot.
+- If a new shot overlaps an existing shot from the same source, either \
+adjust the new range, reuse the existing shot, or report the conflict. Do \
+not silently create the overlap.
+- Reusing the same source video at different, non-overlapping timestamps \
+is allowed.
+- A longer shot must not contain footage already used by an earlier shot \
+unless that repetition is explicitly intentional.
+- Treat the structured timeline (the Edit Plan) as the source of truth. \
+The final edit summary must describe the actual timeline and must not \
+contain shots, transitions, durations, or creative decisions that are \
+not represented in the timeline.
+- Every timeline shot must correspond to a specific storyboard shot or an \
+explicitly justified editorial insertion.
+- Preserve the storyboard shot identifier in storyboard_shot for every \
+timeline shot. Never leave storyboard_shot empty when the shot originated \
+from the storyboard.
+- Do not create multiple timeline shots for the same storyboard shot unless \
+the storyboard explicitly requires it or the split is necessary to \
+implement the storyboard.
+- Every storyboard shot that is required by the storyboard must either be \
+represented in the timeline or be explicitly reported as not implemented.
 - Do not silently omit storyboard shots.
 - Do not silently duplicate storyboard shots.
-- Before finalising the timeline, perform a complete validation pass for duplicate footage, overlapping source ranges, missing storyboard shots, and invalid timeline references.
+- Before finalising the timeline, perform a complete validation pass for \
+duplicate footage, overlapping source ranges, missing storyboard shots, \
+and invalid timeline references.
 
 ### Transition Integrity
 
 - Every transition must reference valid adjacent timeline shots.
-- A transition must identify the correct preceding and following shots; never attach multiple unrelated transitions to the same shot.
-- Do not create transitions that are not represented in the structured timeline.
-- The transition definitions and the final edit summary must agree with the actual timeline.
+- A transition must identify the correct preceding and following shots; \
+never attach multiple unrelated transitions to the same shot.
+- Do not create transitions that are not represented in the structured \
+timeline.
+- The transition definitions and the final edit summary must agree with \
+the actual timeline.
 - Validate transition ordering and placement before finalising the edit.
 
+## Deferred Optimisations (do NOT implement in V1)
 
+Do not attempt: proxy / draft-resolution workflows, aggressive \
+intermediate caching, single-pass filter graphs, render optimisation \
+beyond preset selection, GPU tuning beyond the automatic NVENC fallback, \
+parallel rendering, or intermediate-file elimination. Focus on accuracy.
 
 ## Output
 
 When you have finished rendering and validating the video, respond with a \
 summary of the final video (duration, resolution, file path, and any notes \
-about creative decisions made during editing).
+about creative decisions made during editing). The summary must agree \
+with the committed Edit Plan and the actual rendered output.
 """
 
 
@@ -226,9 +416,15 @@ Use the supplied storyboard, context, and current edit plan to make \
 targeted modifications. You do not need to rebuild the entire edit from \
 scratch — modify only what the user has requested.
 
-Follow the same phased workflow (probe → extract → edit → assemble → \
-render → validate) for any new or modified clips. Reuse existing \
-intermediate clips that are not affected by the changes.
+Treat the supplied existing edit plan as your starting point. Amend it \
+with commit_edit_plan() / update_edit_plan() to reflect only the requested \
+changes, then execute only the affected shots. Reuse existing intermediate \
+clips that are not affected by the changes — a clip that already exists on \
+disk with the same name can be reused without re-extracting it.
+
+Follow the same two-phase workflow (plan → execute) and the same accuracy, \
+traceability, and validation rules as a fresh edit. Reuse of unaffected \
+intermediate clips is the only optimisation permitted in V1.
 """
 
 
@@ -236,7 +432,8 @@ intermediate clips that are not affected by the changes.
 
 class TimelineItem(BaseModel):
     """A single shot in the edit timeline."""
-    id: str = Field(..., description="Unique shot identifier, e.g. 'shot_01'")
+    id: str = Field(..., description="Unique shot identifier, e.g. 'shot01_hook'. "
+                    "Must match the output_name used in extract_clip.")
     source: str = Field(..., description="Source video filename")
     source_start: float = Field(..., ge=0, description="Start time in seconds")
     source_end: float = Field(..., ge=0, description="End time in seconds")
@@ -244,7 +441,10 @@ class TimelineItem(BaseModel):
     transition_in: str | None = Field(None, description="Transition into this clip")
     transition_out: str | None = Field(None, description="Transition out of this clip")
     storyboard_shot: str = Field("", description="Storyboard shot reference for traceability")
-    intermediate_clip: str = Field("", description="Path to extracted/processed clip")
+    storyboard_scene: str = Field("", description="Storyboard scene this shot belongs to")
+    purpose: str = Field("", description="Why this shot is used (e.g. 'Opening hook')")
+    description: str = Field("", description="What the shot shows (e.g. 'Family jumps into water')")
+    intermediate_clip: str = Field("", description="Name/path of the extracted/processed clip")
 
 
 class TransitionSpec(BaseModel):
@@ -270,7 +470,11 @@ class EditFormat(BaseModel):
 
 
 class EditPlan(BaseModel):
-    """The complete machine-readable edit plan."""
+    """The complete machine-readable edit plan.
+
+    The agent commits this plan via commit_edit_plan() before executing any
+    clips, and amends it via update_edit_plan() when boundaries change.
+    """
     version: int = Field(1, ge=1)
     target_duration: float = Field(0.0, ge=0, description="Expected final duration in seconds")
     format: EditFormat = Field(default_factory=EditFormat)
@@ -281,7 +485,113 @@ class EditPlan(BaseModel):
     storyboard_sha: str = Field("", description="Storyboard content hash for traceability")
     output_path: str = Field("", description="Path to the rendered video")
     preset: str = Field("youtube_1080p", description="Render preset used")
+    status: str = Field("draft", description="Plan lifecycle: draft → executing → rendered → verified")
     notes: str = Field("", description="Agent's notes about the edit")
+
+
+# --- Hand-crafted tool schemas for commit_edit_plan / update_edit_plan --------
+# The ollama SDK (0.6.x) flattens nested Pydantic model params to `type: string`
+# via convert_function_to_tool, so a `plan: EditPlan` hint gives the model NO
+# schema guidance. These explicit Tool dicts carry the full nested schema and
+# are passed straight through via Tool.model_validate, bypassing the flattening.
+# The callable is still used for dispatch (matched by __name__).
+
+_EDIT_PLAN_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "commit_edit_plan",
+        "description": (
+            "Commit the structured Edit Plan before executing any clips. This "
+            "is Phase 1 of the workflow. The plan becomes the source of truth "
+            "for the edit. Each timeline item's id MUST match the output_name "
+            "you will pass to extract_clip() so every clip is traceable to its "
+            "plan entry. Only required fields need be supplied; optional "
+            "fields default sensibly.\n\n"
+            "Example plan:\n"
+            '{"timeline": [{"id": "shot01_hook", "source": "GX012053.MP4", '
+            '"source_start": 145.0, "source_end": 155.0, "speed": 1.0, '
+            '"storyboard_scene": "Act 1", "purpose": "Opening hook", '
+            '"description": "Boat POV with spray"}, {"id": "shot02a_boy", '
+            '"source": "GX012054.MP4", "source_start": 0.0, '
+            '"source_end": 7.0, "storyboard_scene": "Act 1", '
+            '"purpose": "Kid moment"}], "target_duration": 178.0, '
+            '"transitions": [{"after": "shot01_hook", "type": "dissolve", '
+            '"duration": 1.5}]}'
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "plan": {
+                    "type": "object",
+                    "description": "The complete Edit Plan object.",
+                    "properties": {
+                        "timeline": {
+                            "type": "array",
+                            "description": "Ordered list of shots in the edit.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string", "description": "Unique shot id, e.g. 'shot01_hook'. Must match the output_name used in extract_clip."},
+                                    "source": {"type": "string", "description": "Source video filename"},
+                                    "source_start": {"type": "number", "description": "Start time in seconds"},
+                                    "source_end": {"type": "number", "description": "End time in seconds"},
+                                    "speed": {"type": "number", "description": "Playback speed multiplier (default 1.0)"},
+                                    "storyboard_scene": {"type": "string", "description": "Storyboard scene this shot belongs to"},
+                                    "purpose": {"type": "string", "description": "Why this shot is used"},
+                                    "description": {"type": "string", "description": "What the shot shows"},
+                                    "transition_in": {"type": "string", "description": "Transition into this clip (optional)"},
+                                    "transition_out": {"type": "string", "description": "Transition out of this clip (optional)"},
+                                },
+                                "required": ["id", "source", "source_start", "source_end"],
+                            },
+                        },
+                        "transitions": {
+                            "type": "array",
+                            "description": "Transitions between adjacent timeline shots.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "after": {"type": "string", "description": "Clip id this transition follows"},
+                                    "type": {"type": "string", "description": "Transition type (cut, dissolve, fadeblack, fadewhite, wipeleft, etc.)"},
+                                    "duration": {"type": "number", "description": "Transition duration in seconds"},
+                                },
+                                "required": ["after", "type"],
+                            },
+                        },
+                        "target_duration": {"type": "number", "description": "Expected final duration in seconds (optional)"},
+                        "audio": {
+                            "type": "object",
+                            "description": "Audio processing plan (optional)",
+                            "properties": {
+                                "volume": {"type": "number", "description": "Master volume multiplier (default 1.0)"},
+                                "fade_in": {"type": "number", "description": "Fade-in duration in seconds"},
+                                "fade_out": {"type": "number", "description": "Fade-out duration in seconds"},
+                                "normalize": {"type": "boolean", "description": "Apply loudnorm normalization"},
+                            },
+                        },
+                        "preset": {"type": "string", "description": "Render preset (default youtube_1080p)"},
+                    },
+                    "required": ["timeline"],
+                },
+            },
+            "required": ["plan"],
+        },
+    },
+}
+
+_UPDATE_EDIT_PLAN_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "update_edit_plan",
+        "description": (
+            "Amend the committed Edit Plan (e.g. after inspect_clip reveals a "
+            "boundary correction, or a tool result shows a range is wrong). "
+            "Re-persists the plan. Pass the complete revised plan. Uses the "
+            "same plan structure as commit_edit_plan."
+        ),
+        "parameters": _EDIT_PLAN_TOOL_SCHEMA["function"]["parameters"],
+    },
+}
 
 
 # --- Config ------------------------------------------------------------------
@@ -392,10 +702,14 @@ def _run_ffmpeg(cmd: list[str], timeout: int = 1800) -> tuple[int, str, str]:
 # --- ToolRegistry ------------------------------------------------------------
 
 class ToolRegistry:
-    """Holds the 9 domain-specific tools and their execution context.
+    """Holds the domain-specific tools and their execution context.
 
     Each tool is a method with type hints + docstring. The Ollama SDK derives
     tool schemas from these. Tools validate all inputs before executing FFmpeg.
+
+    The registry also tracks the agent's committed Edit Plan (via
+    commit_edit_plan / update_edit_plan) so that extract_clip can link each
+    realised clip back to its plan entry for traceability.
     """
 
     def __init__(
@@ -416,9 +730,15 @@ class ToolRegistry:
         self._source_videos: dict[str, Any] = {v.name: v for v in selected_videos}
         self._metadatas = {m.source_filename: m for m in metadatas}
         self._intermediate_clips: dict[str, str] = {}
+        self._current_plan: EditPlan | None = None
+
+    @property
+    def current_plan(self) -> "EditPlan | None":
+        """The latest committed/updated edit plan (or None if not yet committed)."""
+        return self._current_plan
 
     def get_tools(self) -> list[Callable]:
-        """Return the list of tool functions for the Ollama SDK."""
+        """Return the full list of tool functions for the Ollama SDK."""
         return [
             self.probe_video,
             self.inspect_clip,
@@ -428,7 +748,54 @@ class ToolRegistry:
             self.mix_audio,
             self.assemble_timeline,
             self.render_video,
+            self.validate_clip,
             self.validate_video,
+            self.commit_edit_plan,
+            self.update_edit_plan,
+        ]
+
+    def get_plan_phase_tools(self) -> list[Callable]:
+        """Tools allowed during Phase 1 (planning) — before clips exist."""
+        return [
+            self.probe_video,
+            self.inspect_clip,
+            self.commit_edit_plan,
+            self.update_edit_plan,
+        ]
+
+    def get_chat_tools(self) -> list:
+        """Schemas passed to client.chat for the model to call.
+
+        Most tools are callables (the SDK derives their schemas). The two
+        plan tools are passed as explicit Tool dicts because the SDK flattens
+        nested Pydantic model params to `type: string`, which would give the
+        model no schema for the plan structure. The callables in get_tools()
+        are still used for dispatch (matched by __name__).
+        """
+        # Use a shallow copy of the dict so the SDK doesn't mutate the module
+        # constant when it serializes it.
+        return [
+            self.probe_video,
+            self.inspect_clip,
+            self.extract_clip,
+            self.create_edit,
+            self.create_transition,
+            self.mix_audio,
+            self.assemble_timeline,
+            self.render_video,
+            self.validate_clip,
+            self.validate_video,
+            dict(_EDIT_PLAN_TOOL_SCHEMA),
+            dict(_UPDATE_EDIT_PLAN_TOOL_SCHEMA),
+        ]
+
+    def get_plan_phase_chat_tools(self) -> list:
+        """Schemas passed to client.chat during Phase 1 (planning)."""
+        return [
+            self.probe_video,
+            self.inspect_clip,
+            dict(_EDIT_PLAN_TOOL_SCHEMA),
+            dict(_UPDATE_EDIT_PLAN_TOOL_SCHEMA),
         ]
 
     # --- Tool 1: probe_video -----------------------------------------------
@@ -635,16 +1002,56 @@ class ToolRegistry:
             ).to_tool_message()
 
         self._intermediate_clips[safe_name] = str(out_path)
+
+        # Probe the newly created clip so the agent gets immediate feedback
+        # on actual duration / resolution / audio and can detect a wrong range
+        # (e.g. actual_duration != end_time - start_time) and re-extract.
+        actual_duration = 0.0
+        actual_resolution = "unknown"
+        audio_present = False
+        probe = None
+        try:
+            from .ffmpeg.probe import run_ffprobe as _run_probe
+            probe = _run_probe(str(out_path))
+        except Exception:
+            probe = None
+        if probe is not None:
+            actual_duration = probe.duration
+            actual_resolution = f"{probe.width}x{probe.height}" if probe.width else "unknown"
+            # ProbeResult parses only the video stream; check audio from raw.
+            for stream in (probe.raw or {}).get("streams", []):
+                if stream.get("codec_type") == "audio":
+                    audio_present = True
+                    break
+
+        # Link this realised clip back to its committed plan entry (if any)
+        # for traceability, then re-persist the plan.
+        linked_scene = ""
+        if self._current_plan is not None:
+            for item in self._current_plan.timeline:
+                if item.id == safe_name:
+                    item.intermediate_clip = safe_name
+                    linked_scene = item.storyboard_scene
+                    break
+            if linked_scene:
+                self._persist_current_plan()
+
+        result_data = {
+            "output_name": safe_name,
+            "output_path": str(out_path),
+            "source": fname,
+            "start_time": start_time,
+            "end_time": end_time,
+            "duration": end_time - start_time,
+            "actual_duration": round(actual_duration, 3),
+            "actual_resolution": actual_resolution,
+            "audio_present": audio_present,
+        }
+        if linked_scene:
+            result_data["linked_storyboard_scene"] = linked_scene
         return ToolResult(
             True,
-            {
-                "output_name": safe_name,
-                "output_path": str(out_path),
-                "source": fname,
-                "start_time": start_time,
-                "end_time": end_time,
-                "duration": end_time - start_time,
-            },
+            result_data,
             log=f"extract_clip: {fname} {start_time}-{end_time} -> {safe_name}.mp4",
             duration_s=time.time() - start,
         ).to_tool_message()
@@ -990,9 +1397,19 @@ class ToolRegistry:
                           output_name: str = "timeline") -> dict:
         """Assemble multiple clips into a single timeline video.
 
+        `clips` is the ordered list of SHOT clips to concatenate. Do NOT
+        include transition clips (created by create_transition) in this list
+        — transitions are described purely in the `transitions` parameter
+        and applied between adjacent shots. If you already created
+        transition clips, pass the original shot clips here and describe
+        the transitions in the `transitions` array.
+
         Args:
-            clips: List of clip names in order.
-            transitions: List of transition specs with 'after', 'type', 'duration'.
+            clips: Ordered list of shot clip names (no transition clips).
+            transitions: List of transition specs with 'after', 'type',
+                'duration'. Each 'after' is the clip id that the transition
+                follows; the transition is applied between that clip and the
+                next clip in the `clips` list.
             audio_plan: Optional dict with volume, fade_in, fade_out, normalize.
             output_name: Name for the output (without extension).
         """
@@ -1224,22 +1641,28 @@ class ToolRegistry:
 
     def validate_video(self, video_path: str,
                         expected_duration: float | None = None,
-                        expected_resolution: str | None = None) -> dict:
-        """Validate a rendered video file using ffprobe.
+                        expected_resolution: str | None = None,
+                        expected_fps: float | None = None,
+                        require_audio: bool = False) -> dict:
+        """Validate a rendered or assembled video file using ffprobe.
+
+        Resolves the path across the output, clips, and preview directories
+        so it can validate the assembled timeline (in clips/) and the final
+        render (in output/).
 
         Args:
-            video_path: Path to the video to validate.
+            video_path: Path or name of the video to validate.
             expected_duration: Optional expected duration in seconds.
             expected_resolution: Optional expected resolution as WxH.
+            expected_fps: Optional expected frame rate.
+            require_audio: If true, fail when no audio stream is present.
         """
         start = time.time()
-        p = Path(video_path)
-        if not p.is_absolute():
-            p = self._output_dir / video_path
-        if not p.exists():
+        p = self._resolve_any_video(video_path)
+        if p is None:
             return ToolResult(
                 False,
-                {"error": f"File does not exist: {p}"},
+                {"error": f"File does not exist: {video_path}"},
                 log="validate_video: file not found",
                 duration_s=time.time() - start,
             ).to_tool_message()
@@ -1253,6 +1676,13 @@ class ToolRegistry:
                 log="validate_video: ffprobe failed",
                 duration_s=time.time() - start,
             ).to_tool_message()
+
+        audio_present = self._has_audio_stream(result.raw)
+        file_size = 0
+        try:
+            file_size = p.stat().st_size
+        except OSError:
+            pass
 
         issues: list[str] = []
         if result.duration <= 0:
@@ -1268,6 +1698,14 @@ class ToolRegistry:
                     f"Resolution mismatch: expected {expected_resolution}, "
                     f"got {result.width}x{result.height}"
                 )
+        if expected_fps and abs(result.fps - expected_fps) > 0.5:
+            issues.append(
+                f"Frame rate mismatch: expected {expected_fps}fps, got {result.fps}fps"
+            )
+        if require_audio and not audio_present:
+            issues.append("Required audio stream is missing")
+        if file_size == 0:
+            issues.append("File is empty (0 bytes)")
 
         passed = len(issues) == 0
         data = {
@@ -1276,6 +1714,8 @@ class ToolRegistry:
             "resolution": f"{result.width}x{result.height}",
             "codec": result.codec,
             "fps": result.fps,
+            "audio_present": audio_present,
+            "file_size": file_size,
             "issues": issues,
             "path": str(p),
         }
@@ -1285,7 +1725,269 @@ class ToolRegistry:
             duration_s=time.time() - start,
         ).to_tool_message()
 
+    # --- Tool 10: validate_clip ---------------------------------------------
+
+    def validate_clip(self, clip_name: str,
+                      expected_duration: float | None = None,
+                      expected_resolution: str | None = None) -> dict:
+        """Validate an intermediate clip in the clips directory using ffprobe.
+
+        Use this after extract_clip() / create_edit() to verify each clip:
+        duration, resolution, frame rate, audio presence, file existence.
+        If actual_duration does not match expected_duration, the range was
+        likely wrong and the clip should be re-extracted.
+
+        Args:
+            clip_name: Name of the clip (with or without extension).
+            expected_duration: Optional expected duration in seconds.
+            expected_resolution: Optional expected resolution as WxH.
+        """
+        start = time.time()
+        p = self._resolve_clip(Path(clip_name).stem)
+        if p is None:
+            return ToolResult(
+                False,
+                {"error": f"Clip '{clip_name}' not found in clips directory"},
+                log="validate_clip: clip not found",
+                duration_s=time.time() - start,
+            ).to_tool_message()
+
+        from .ffmpeg.probe import run_ffprobe
+        result = run_ffprobe(str(p))
+        if result is None:
+            return ToolResult(
+                False,
+                {"error": "ffprobe failed — clip may be corrupt or unplayable"},
+                log="validate_clip: ffprobe failed",
+                duration_s=time.time() - start,
+            ).to_tool_message()
+
+        audio_present = self._has_audio_stream(result.raw)
+        file_size = 0
+        try:
+            file_size = p.stat().st_size
+        except OSError:
+            pass
+
+        issues: list[str] = []
+        if result.duration <= 0:
+            issues.append("Zero or negative duration")
+        if expected_duration and abs(result.duration - expected_duration) > 0.5:
+            issues.append(
+                f"Duration mismatch: expected {expected_duration}s, "
+                f"got {result.duration}s"
+            )
+        if expected_resolution:
+            exp_w, exp_h = expected_resolution.split("x")
+            if result.width != int(exp_w) or result.height != int(exp_h):
+                issues.append(
+                    f"Resolution mismatch: expected {expected_resolution}, "
+                    f"got {result.width}x{result.height}"
+                )
+        if file_size == 0:
+            issues.append("File is empty (0 bytes)")
+
+        passed = len(issues) == 0
+        data = {
+            "passed": passed,
+            "clip": p.name,
+            "duration": result.duration,
+            "resolution": f"{result.width}x{result.height}",
+            "fps": result.fps,
+            "audio_present": audio_present,
+            "file_size": file_size,
+            "issues": issues,
+            "path": str(p),
+        }
+        return ToolResult(
+            passed, data,
+            log=f"validate_clip: {p.name} {'PASS' if passed else 'FAIL: ' + '; '.join(issues)}",
+            duration_s=time.time() - start,
+        ).to_tool_message()
+
+    # --- Tool 11: commit_edit_plan -------------------------------------------
+
+    def commit_edit_plan(self, plan: dict) -> dict:
+        """Commit the structured Edit Plan before executing any clips.
+
+        This is Phase 1 of the workflow. The plan becomes the source of
+        truth for the edit. Each timeline item's id MUST match the
+        output_name you will pass to extract_clip() so every clip is
+        traceable to its plan entry.
+
+        After commit_edit_plan() is called, the full tool set becomes
+        available for Phase 2 (execution).
+
+        Args:
+            plan: The complete Edit Plan as a JSON object. Must validate
+                against the EditPlan schema. Each timeline item needs:
+                id, source, source_start, source_end. Optional but
+                recommended: storyboard_scene, purpose, description.
+        """
+        return self._store_plan(plan, "draft")
+
+    # --- Tool 12: update_edit_plan -------------------------------------------
+
+    def update_edit_plan(self, plan: dict) -> dict:
+        """Amend the committed Edit Plan (e.g. after inspect_clip reveals a
+        boundary correction, or a tool result shows a range is wrong).
+
+        Re-persists the plan. The plan remains the source of truth.
+
+        Args:
+            plan: The complete revised Edit Plan as a JSON object.
+        """
+        return self._store_plan(plan, "executing")
+
     # --- Internal helpers ----------------------------------------------------
+
+    def _store_plan(self, plan: dict, default_status: str) -> dict:
+        """Validate, store, and persist an Edit Plan. Returns a tool message.
+
+        Hard schema errors (Pydantic validation failures) reject the plan.
+        Consistency issues (unknown source, out-of-range timestamp, overlap)
+        do NOT reject — the plan is accepted and the issues are returned as
+        warnings so the agent can correct them during execution. This avoids
+        a retry loop where the agent keeps resubmitting the plan.
+        """
+        start = time.time()
+        if not isinstance(plan, dict):
+            return ToolResult(
+                False,
+                {"error": "plan must be a JSON object"},
+                log="commit_edit_plan: invalid plan",
+                duration_s=time.time() - start,
+            ).to_tool_message()
+        try:
+            parsed = EditPlan.model_validate(plan)
+        except ValidationError as e:
+            return ToolResult(
+                False,
+                {"error": f"Invalid edit plan: {e}"},
+                log="commit_edit_plan: validation failed",
+                duration_s=time.time() - start,
+            ).to_tool_message()
+
+        # Check plan-level consistency against probed source durations.
+        # These are warnings, not hard errors — accept the plan and let the
+        # agent fix issues during execution (e.g. via inspect_clip).
+        warnings = self._validate_plan_consistency(parsed)
+
+        if not parsed.status or parsed.status == "draft":
+            parsed.status = default_status
+        self._current_plan = parsed
+        self._persist_current_plan()
+        result_data = {
+            "plan": parsed.model_dump(),
+            "status": parsed.status,
+            "timeline_count": len(parsed.timeline),
+        }
+        if warnings:
+            result_data["warnings"] = warnings
+            result_data["note"] = (
+                "Plan accepted but has issues that should be corrected during "
+                "execution (e.g. via inspect_clip or update_edit_plan)."
+            )
+        return ToolResult(
+            True,
+            result_data,
+            log=f"commit_edit_plan: {len(parsed.timeline)} shots, status={parsed.status}"
+                + (f", {len(warnings)} warnings" if warnings else ""),
+            duration_s=time.time() - start,
+        ).to_tool_message()
+
+    def _validate_plan_consistency(self, plan: EditPlan) -> list[str]:
+        """Check plan timeline items against known source durations.
+
+        Returns a list of human-readable issue strings (empty if consistent).
+        Unknown sources and out-of-range timestamps are reported so the agent
+        can correct them before execution.
+        """
+        issues: list[str] = []
+        seen_ranges: dict[str, list[tuple[float, float]]] = {}
+        ids_seen: set[str] = set()
+        for item in plan.timeline:
+            if item.id in ids_seen:
+                issues.append(f"Duplicate clip id '{item.id}'")
+            ids_seen.add(item.id)
+
+            if item.source not in self._source_videos:
+                issues.append(
+                    f"Shot '{item.id}': unknown source '{item.source}'. "
+                    f"Available: {list(self._source_videos.keys())}"
+                )
+            else:
+                meta = self._metadatas.get(item.source)
+                dur = meta.duration if meta else 0.0
+                if dur > 0:
+                    if item.source_start < 0 or item.source_end > dur:
+                        issues.append(
+                            f"Shot '{item.id}': range {item.source_start}-{item.source_end} "
+                            f"exceeds source '{item.source}' duration {dur}s"
+                        )
+                if item.source_start >= item.source_end:
+                    issues.append(
+                        f"Shot '{item.id}': start ({item.source_start}) >= "
+                        f"end ({item.source_end})"
+                    )
+                # Overlap detection per source
+                ranges = seen_ranges.setdefault(item.source, [])
+                for (s, e) in ranges:
+                    if item.source_start < e and item.source_end > s:
+                        issues.append(
+                            f"Shot '{item.id}': overlaps existing shot on "
+                            f"'{item.source}' ({s}-{e})"
+                        )
+                        break
+                ranges.append((item.source_start, item.source_end))
+        return issues
+
+    def _persist_current_plan(self) -> None:
+        """Write self._current_plan to video/edit_plan.json."""
+        if self._current_plan is None:
+            return
+        try:
+            self._video_dir.mkdir(parents=True, exist_ok=True)
+            (self._video_dir / EDIT_PLAN_FILENAME).write_text(
+                self._current_plan.model_dump_json(indent=2), encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def _has_audio_stream(self, raw: dict | None) -> bool:
+        """Return True if the ffprobe raw data contains an audio stream."""
+        if not raw:
+            return False
+        for stream in raw.get("streams", []):
+            if stream.get("codec_type") == "audio":
+                return True
+        return False
+
+    def _resolve_any_video(self, name: str) -> Path | None:
+        """Resolve a video path/name across output, clips, and preview dirs.
+
+        Accepts an absolute path, a name with extension, or a bare stem.
+        """
+        p = Path(name)
+        if p.is_absolute() and p.exists():
+            return p
+        candidates = [p.name, p.name if p.suffix else f"{p.name}.mp4"]
+        if not p.suffix:
+            candidates.append(f"{p.name}.mp4")
+        # de-duplicate preserving order
+        seen = set()
+        names = []
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                names.append(c)
+        for d in (self._output_dir, self._clips_dir, self._preview_dir):
+            for n in names:
+                full = d / n
+                if full.exists():
+                    return full
+        # Also try the input as-is relative to output dir.
+        return None
 
     def _resolve_clip(self, name: str) -> Path | None:
         """Resolve a clip name to its file path.
@@ -1317,12 +2019,20 @@ def run_editing_agent(
     model: str,
     system_prompt: str,
     user_prompt: str,
-    tools: list,
+    registry: "ToolRegistry",
     progress_cb: Callable[[str], None] | None = None,
     log_cb: Callable[[str], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
 ) -> tuple[str, list[dict]]:
-    """Run the multi-turn tool-calling agent loop.
+    """Run the two-phase, multi-turn tool-calling agent loop.
+
+    Phase 1 — Plan: only probe_video / inspect_clip / commit_edit_plan /
+    update_edit_plan are available. Runs until commit_edit_plan is called
+    (detected via ``registry.current_plan`` becoming non-None) or the round
+    budget is exhausted.
+
+    Phase 2 — Execute: the full tool set is available. The agent executes
+    the committed plan, calling update_edit_plan if boundaries change.
 
     Returns (final_text, tool_log) where tool_log is a list of dicts with
     tool name, args, result, success, and duration.
@@ -1334,12 +2044,33 @@ def run_editing_agent(
     tool_log: list[dict] = []
     final_text = ""
 
+    # Callables used for dispatch (matched by __name__) and phase gating.
+    phase1_callables = registry.get_plan_phase_tools()
+    all_callables = registry.get_tools()
+
+    # Schemas passed to client.chat. The plan tools are explicit Tool dicts
+    # because the SDK flattens nested Pydantic params to `type: string`,
+    # which would give the model no schema for the plan structure.
+    phase1_schemas = registry.get_plan_phase_chat_tools()
+    all_schemas = registry.get_chat_tools()
+
+    def _active_schemas() -> list:
+        return phase1_schemas if registry.current_plan is None else all_schemas
+
+    def _phase_label() -> str:
+        return "Phase 1 (plan)" if registry.current_plan is None else "Phase 2 (execute)"
+
+    plan_committed_round: int | None = None
+
     for round_trip in range(MAX_AGENT_ROUND_TRIPS):
         if is_cancelled and is_cancelled():
             return "Cancelled", tool_log
 
+        tools = _active_schemas()
         if progress_cb:
-            progress_cb(f"Agent round {round_trip + 1}/{MAX_AGENT_ROUND_TRIPS}...")
+            progress_cb(
+                f"{_phase_label()} — round {round_trip + 1}/{MAX_AGENT_ROUND_TRIPS}..."
+            )
 
         response = client.chat(model=model, messages=messages, tools=tools)
         assistant_msg = response.message
@@ -1355,25 +2086,47 @@ def run_editing_agent(
             args = call.function.arguments
             args_str = json.dumps(args) if isinstance(args, dict) else str(args)
 
-            if log_cb:
-                log_cb(f"[tool] {tool_name}({args_str})")
+            # Enforce phase gating: reject execute-phase tools during planning.
+            if registry.current_plan is None and tool_name not in {
+                getattr(t, "__name__", "") for t in phase1_callables
+            }:
+                msg = (f"Tool '{tool_name}' is not available during the "
+                       f"planning phase. Call commit_edit_plan() first.")
+                result_data = {"error": msg}
+                if log_cb:
+                    log_cb(f"[tool] {tool_name} REJECTED (planning phase): {msg}")
+            else:
+                if log_cb:
+                    log_cb(f"[tool] {tool_name}({args_str})")
 
-            round_start = time.time()
-            result_data = _execute_tool_call(tools, tool_name, args)
-            round_dur = time.time() - round_start
+                round_start = time.time()
+                result_data = _execute_tool_call(all_callables, tool_name, args)
+                round_dur = time.time() - round_start
 
-            tool_log.append({
-                "tool": tool_name,
-                "args": args,
-                "result": result_data.get("data", result_data),
-                "success": not bool(result_data.get("error")),
-                "duration_s": round_dur,
-                "timestamp": _now_iso(),
-            })
+                tool_log.append({
+                    "tool": tool_name,
+                    "args": args,
+                    "result": result_data.get("data", result_data),
+                    "success": not bool(result_data.get("error")),
+                    "duration_s": round_dur,
+                    "timestamp": _now_iso(),
+                })
 
-            if log_cb:
-                status = "OK" if not result_data.get("error") else f"FAIL: {result_data.get('error', '')[:100]}"
-                log_cb(f"[tool] {tool_name} -> {status}")
+                # Detect transition into Phase 2.
+                if tool_name in ("commit_edit_plan", "update_edit_plan") \
+                        and registry.current_plan is not None \
+                        and plan_committed_round is None:
+                    plan_committed_round = round_trip
+                    if log_cb:
+                        log_cb(
+                            f"Edit plan committed: "
+                            f"{len(registry.current_plan.timeline)} shots. "
+                            f"Switching to execute phase."
+                        )
+
+                if log_cb:
+                    status = "OK" if not result_data.get("error") else f"FAIL: {result_data.get('error', '')[:100]}"
+                    log_cb(f"[tool] {tool_name} -> {status}")
 
             messages.append({
                 "role": "tool",
@@ -1388,7 +2141,14 @@ def run_editing_agent(
 
 
 def _execute_tool_call(tools: list, tool_name: str, args: Any) -> dict:
-    """Execute a tool call by dispatching to the matching function."""
+    """Execute a tool call by dispatching to the matching function.
+
+    Returns the tool's result data as a plain dict (NOT a wrapped tool
+    message). Tool methods return ``ToolResult.to_tool_message()`` which
+    produces ``{"role": "tool", "content": <json string>}``; we unwrap that
+    back to the inner data dict so the agent loop can detect ``"error"``
+    keys and send a single-wrapped tool message to the model.
+    """
     tool_func = None
     for t in tools:
         if getattr(t, "__name__", "") == tool_name:
@@ -1401,6 +2161,13 @@ def _execute_tool_call(tools: list, tool_name: str, args: Any) -> dict:
             result = tool_func(**args)
         else:
             result = tool_func(args)
+        # Unwrap a to_tool_message() dict back to the inner data dict.
+        if isinstance(result, dict) and result.get("role") == "tool" \
+                and "content" in result and "error" not in result:
+            try:
+                return json.loads(result["content"])
+            except (json.JSONDecodeError, TypeError):
+                return {"error": f"Tool returned unreadable result: {result.get('content', '')[:200]}"}
         if isinstance(result, dict):
             return result
         return {"result": str(result)}
@@ -1411,23 +2178,41 @@ def _execute_tool_call(tools: list, tool_name: str, args: Any) -> dict:
 # --- Prompt building ---------------------------------------------------------
 
 def build_generation_prompt(storyboard_md: str, context_md: str) -> str:
-    """Build the user-message content for an initial edit generation."""
+    """Build the user-message content for an initial edit generation.
+
+    Instructs the agent to follow the two-phase workflow: first probe
+    referenced sources + inspect uncertain boundaries + commit_edit_plan,
+    then execute the plan.
+    """
     return (
         f"## Storyboard\n\n{storyboard_md.strip()}\n\n"
         f"## Available Context\n\n{context_md.strip()}\n\n"
         f"## Task\n\n"
-        f"Produce a final edited video based on the storyboard. Follow the "
-        f"editing workflow: probe all source videos, extract clips, apply "
-        f"edits and transitions, assemble the timeline, render, and validate. "
-        f"Use the tools provided — do not write FFmpeg commands. "
-        f"Reference source videos by filename. Do not invent footage. "
-        f"Report any gaps or issues you encounter."
+        f"Produce a final edited video based on the storyboard using the "
+        f"two-phase workflow.\n\n"
+        f"Phase 1 — Plan: call probe_video() for every source video "
+        f"referenced in the storyboard. Call inspect_clip() where a "
+        f"storyboard moment's exact boundaries are uncertain. Then call "
+        f"commit_edit_plan() with a complete structured Edit Plan. Each "
+        f"timeline item's id must match the output_name you will use in "
+        f"extract_clip().\n\n"
+        f"Phase 2 — Execute: with the full tool set, create each clip, "
+        f"validate it with validate_clip(), apply transitions/effects, "
+        f"assemble the timeline, render, and validate the output.\n\n"
+        f"Use the tools provided — do not write FFmpeg commands. Reference "
+        f"source videos by exact filename. Do not invent footage. Report "
+        f"any gaps or issues you encounter."
     )
 
 
 def build_refinement_prompt(feedback: str, edit_plan_json: str,
                              storyboard_md: str, context_md: str) -> str:
-    """Build the user-message content for a refinement based on user feedback."""
+    """Build the user-message content for a refinement based on user feedback.
+
+    The existing edit plan is supplied so the agent amends it (via
+    commit_edit_plan / update_edit_plan) rather than starting blank, and
+    reuses unaffected intermediate clips.
+    """
     return (
         f"{REFINEMENT_INSTRUCTIONS.strip()}\n\n"
         f"## User Feedback\n\n{feedback.strip()}\n\n"
@@ -1435,9 +2220,13 @@ def build_refinement_prompt(feedback: str, edit_plan_json: str,
         f"## Storyboard\n\n{storyboard_md.strip()}\n\n"
         f"## Available Context\n\n{context_md.strip()}\n\n"
         f"## Task\n\n"
-        f"Apply the user's feedback to refine the existing video edit. "
-        f"Preserve good decisions from the current edit. Modify only what "
-        f"the user has requested. Use the tools to make changes and re-render."
+        f"Apply the user's feedback following the two-phase workflow. First, "
+        f"amend the current edit plan with commit_edit_plan() (or "
+        f"update_edit_plan()) to reflect only the requested changes. Then "
+        f"execute only the affected shots — reuse existing intermediate "
+        f"clips that are not affected (a clip already on disk with the same "
+        f"name can be reused without re-extracting). Re-assemble, re-render, "
+        f"and re-validate. Preserve good decisions from the current edit."
     )
 
 
@@ -1528,8 +2317,11 @@ def build_edit_plan_from_tool_log(tool_log: list[dict], storyboard_version: int 
                                   storyboard_sha: str = "") -> EditPlan:
     """Attempt to build an EditPlan from the tool call log.
 
-    Extracts timeline items from extract_clip calls and transitions from
-    create_transition calls.
+    Fallback only: the primary path is the proactive plan committed via
+    commit_edit_plan / update_edit_plan during the agent run. This builder
+    reconstructs a plan from extract_clip / create_transition calls when no
+    committed plan exists, populating the traceability fields best-effort
+    from the available tool arguments and results.
     """
     timeline: list[TimelineItem] = []
     transitions: list[TransitionSpec] = []
@@ -1541,13 +2333,15 @@ def build_edit_plan_from_tool_log(tool_log: list[dict], storyboard_version: int 
         result = entry.get("result", {})
         if tool == "extract_clip" and not result.get("error"):
             shot_num += 1
+            clip_name = result.get("output_name", f"shot_{shot_num:02d}")
             timeline.append(TimelineItem(
-                id=f"shot_{shot_num:02d}",
+                id=clip_name,
                 source=args.get("video_path", ""),
                 source_start=args.get("start_time", 0.0),
                 source_end=args.get("end_time", 0.0),
                 speed=1.0,
-                intermediate_clip=result.get("output_name", ""),
+                intermediate_clip=clip_name,
+                description=result.get("linked_storyboard_scene", ""),
             ))
         elif tool == "create_transition" and not result.get("error"):
             transitions.append(TransitionSpec(
@@ -1565,5 +2359,6 @@ def build_edit_plan_from_tool_log(tool_log: list[dict], storyboard_version: int 
         transitions=transitions,
         storyboard_version=storyboard_version,
         storyboard_sha=storyboard_sha,
+        status="executing" if timeline else "draft",
         output_path="",
     )
