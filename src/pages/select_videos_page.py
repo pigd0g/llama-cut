@@ -22,6 +22,7 @@ from ..theme import (
     SPACING_MD,
     SPACING_SM,
 )
+from ..workers.probe_worker import ProbeWorker
 from ..workers.thumbnail_worker import ThumbnailWorker
 from .video_preview import show_video_context_menu
 from .widgets import ThumbDelegate
@@ -47,6 +48,7 @@ class SelectVideosPage(QWidget):
         super().__init__(parent)
         self._state = state
         self._thumb_worker: ThumbnailWorker | None = None
+        self._probe_worker: ProbeWorker | None = None
         self._build()
         self._connect()
 
@@ -116,6 +118,9 @@ class SelectVideosPage(QWidget):
 
     def _connect(self) -> None:
         self._state.selection_changed.connect(self._update_count)
+        # Re-populate subtitles when probing completes so resolution/duration
+        # (which are only known after ffprobe runs) are reflected in the cards.
+        self._state.videos_probed.connect(self._populate)
 
     # --- Lifecycle ----------------------------------------------------------
     def refresh(self) -> None:
@@ -136,13 +141,51 @@ class SelectVideosPage(QWidget):
         self._state.set_videos(videos)
         self._populate()
         self._start_thumbnails()
+        # Probe any unprobed videos so resolution/duration show in the cards.
+        self._start_probe([v for v in videos if not v.probed])
+
+    # --- Probing -----------------------------------------------------------
+    def _start_probe(self, videos: list[Video]) -> None:
+        if not videos:
+            return
+        if self._probe_worker and self._probe_worker.isRunning():
+            self._probe_worker.cancel()
+            self._probe_worker.quit()
+            self._probe_worker.wait(2000)
+        self._probe_worker = ProbeWorker(videos, self)
+        self._probe_worker.video_probed.connect(self._on_video_probed)
+        self._probe_worker.finished_all.connect(self._on_probe_done)
+        self._probe_worker.start()
+
+    def _on_video_probed(self, video: Video) -> None:
+        # Update in-memory state + the model row so the subtitle (resolution +
+        # duration) fills in as each probe completes.
+        self._state.update_video(video)
+        for row in range(self.model.rowCount()):
+            idx = self.model.index(row, 0)
+            if idx.data(Qt.ItemDataRole.UserRole + 1) == video.path:
+                self.model.setData(
+                    idx,
+                    {"title": video.name,
+                     "subtitle": _meta_label(video.size_bytes,
+                                              video.width, video.height,
+                                              video.duration)},
+                    Qt.ItemDataRole.UserRole,
+                )
+                break
+
+    def _on_probe_done(self) -> None:
+        self._state.mark_probed()
 
     def _populate(self) -> None:
         self.model.clear()
         for v in self._state.videos:
             item = QStandardItem()
             item.setData(v.path, Qt.ItemDataRole.UserRole + 1)  # path stash
-            item.setData({"title": v.name, "subtitle": _size_label(v.size_bytes)},
+            item.setData({"title": v.name,
+                          "subtitle": _meta_label(v.size_bytes,
+                                                   v.width, v.height,
+                                                   v.duration)},
                          Qt.ItemDataRole.UserRole)
             item.setData(Qt.CheckState.Checked if v.selected else Qt.CheckState.Unchecked,
                          Qt.ItemDataRole.CheckStateRole)
@@ -244,6 +287,19 @@ class SelectVideosPage(QWidget):
         self._state.set_stage(2)
 
 
+def _meta_label(size_bytes: int, width: int, height: float, duration: float) -> str:
+    """Build the subtitle line: size (Mb), resolution, duration (hh:mm:ss)."""
+    parts: list[str] = []
+    size = _size_label(size_bytes)
+    if size:
+        parts.append(size)
+    if width and height:
+        parts.append(f"{int(width)}x{int(height)}")
+    if duration > 0:
+        parts.append(_duration_hms(duration))
+    return "  ·  ".join(parts)
+
+
 def _size_label(n: int) -> str:
     if n <= 0:
         return ""
@@ -254,3 +310,16 @@ def _size_label(n: int) -> str:
         f /= 1024
         i += 1
     return f"{f:.1f} {units[i]}" if i > 0 else f"{n} B"
+
+
+def _duration_hms(seconds: float) -> str:
+    """Render a duration in seconds as H:MM:SS (or M:SS for short videos)."""
+    if seconds <= 0:
+        return ""
+    total = int(round(seconds))
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"

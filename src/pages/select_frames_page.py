@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
@@ -72,6 +73,13 @@ class SelectFramesPage(QWidget):
         self.select_none_btn.clicked.connect(self._on_select_none)
         toolbar.addWidget(self.select_all_btn)
         toolbar.addWidget(self.select_none_btn)
+        self.select_random_btn = QPushButton("Select Random Frames")
+        self.select_random_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.select_random_btn.setToolTip(
+            "Pick 1-2 frames at random per video for analysis."
+        )
+        self.select_random_btn.clicked.connect(self._on_select_random)
+        toolbar.addWidget(self.select_random_btn)
         toolbar.addStretch()
         root.addLayout(toolbar)
 
@@ -193,7 +201,9 @@ class SelectFramesPage(QWidget):
                 "title": f.filename,
                 "subtitle": f"{_pts_label(f.pts_time)}  ·  {f.video_stem}",
             }, Qt.ItemDataRole.UserRole)
-            item.setData(Qt.CheckState.Checked, Qt.ItemDataRole.CheckStateRole)
+            # Default: all frames deselected so the user explicitly chooses
+            # which frames to analyse.
+            item.setData(Qt.CheckState.Unchecked, Qt.ItemDataRole.CheckStateRole)
             pix = QPixmap()
             if Path(f.path).exists():
                 pix = QPixmap(f.path)
@@ -229,6 +239,34 @@ class SelectFramesPage(QWidget):
         for row in range(self.model.rowCount()):
             self.model.setData(self.model.index(row, 0),
                                Qt.CheckState.Unchecked, Qt.ItemDataRole.CheckStateRole)
+        self._update_count()
+        self._update_button_state()
+
+    def _on_select_random(self) -> None:
+        """Pick 1-2 frames at random per video and check only those.
+
+        Operates on the currently visible (filtered) frames. All other frames
+        are unchecked first, then 1-2 per video are chosen at random.
+        """
+        # Uncheck everything first.
+        for row in range(self.model.rowCount()):
+            self.model.setData(self.model.index(row, 0),
+                               Qt.CheckState.Unchecked, Qt.ItemDataRole.CheckStateRole)
+        # Group visible frame rows by video stem.
+        rows_by_video: dict[str, list[int]] = {}
+        for row in range(self.model.rowCount()):
+            idx = self.model.index(row, 0)
+            p = idx.data(Qt.ItemDataRole.UserRole + 1)
+            frame = next((f for f in self._visible_frames() if f.path == p), None)
+            if frame is not None:
+                rows_by_video.setdefault(frame.video_stem, []).append(row)
+        # Pick 1-2 rows at random per video and check them.
+        for stem, rows in rows_by_video.items():
+            n = min(len(rows), random.randint(1, 2))
+            chosen = random.sample(rows, n)
+            for row in chosen:
+                self.model.setData(self.model.index(row, 0),
+                                   Qt.CheckState.Checked, Qt.ItemDataRole.CheckStateRole)
         self._update_count()
         self._update_button_state()
 
@@ -269,6 +307,18 @@ class SelectFramesPage(QWidget):
     def _is_busy(self) -> bool:
         return self._worker is not None and self._worker.isRunning()
 
+    def _has_frame_analysis(self) -> bool:
+        """True if any selected video has a non-empty Frame Analysis doc on disk."""
+        if self._context_store is None:
+            return False
+        for v in self._state.selected_videos:
+            doc = self._context_store.get(v.stem, ContextType.FRAME_ANALYSIS)
+            if doc is not None and doc.content and doc.content.strip():
+                # Ignore the placeholder used for empty/failed runs.
+                if doc.content.strip() != "_Not yet generated._":
+                    return True
+        return False
+
     def _update_button_state(self) -> None:
         sel = self._selected_frames()
         busy = self._is_busy()
@@ -277,7 +327,11 @@ class SelectFramesPage(QWidget):
         self.concurrency_spin.setEnabled(not busy)
         self.select_all_btn.setEnabled(not busy)
         self.select_none_btn.setEnabled(not busy)
+        self.select_random_btn.setEnabled(not busy)
         self.video_filter.setEnabled(not busy)
+        # Review Context is only reachable once at least one video has a
+        # non-empty Frame Analysis context slot on disk.
+        self.review_btn.setEnabled(self._has_frame_analysis() and not busy)
 
     def _on_analyse(self) -> None:
         if self._is_busy():

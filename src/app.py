@@ -3,8 +3,8 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtGui import QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -18,9 +18,11 @@ from PyQt6.QtWidgets import (
 )
 
 from . import paths
+from .icons import material_icon_pixmap
 from .state import PipelineState
 from .theme import (
     COLOR_DANGER,
+    COLOR_ON_SURFACE,
     SPACING_LG,
     SPACING_MD,
     SPACING_SM,
@@ -42,30 +44,36 @@ from .pages.welcome_page import WelcomePage
 # Stage indices: 0=Welcome, 1=Select Videos, 2=Context, 3=Transcription,
 # 4=Frame Extraction, 5=Frame Analysis, 6=Context Review, 7=Storyboard,
 # 8=Final Video, 9=Result
+# Icons use Material Symbols ligature names (never raw codepoints) — rendered
+# via the material_icon helper, per the Icons section in AGENTS.md.
 NAV_ICONS = {
-    0: "\ue8cc",  # folder
-    1: "\ue8cc",  # folder
-    2: "\ue873",  # description / article
-    3: "\ue31a",  # mic
-    4: "\ue02a",  # video
-    5: "\ue413",  # photo_library
-    6: "\ue873",  # description / article (context review)
-    7: "\ue873",  # description / article (storyboard)
-    8: "\ue02a",  # video (final video)
-    9: "\ue02a",  # video (result)
+    0: "home",           # Welcome
+    1: "video_library",  # Select Videos
+    2: "description",    # Context
+    3: "mic",            # Transcription
+    4: "movie",          # Frame Extraction
+    5: "photo_library",  # Frame Analysis
+    6: "view_quilt",     # Context Review
+    7: "dashboard",      # Storyboard
+    8: "video_settings", # Final Video
+    9: "play_circle",    # Result
 }
 NAV_LABELS = {
     0: "Welcome",
-    1: "1 · Select Videos",
-    2: "2 · Context",
-    3: "3 · Transcription",
-    4: "4 · Frame Extraction",
-    5: "5 · Frame Analysis",
-    6: "6 · Context Review",
-    7: "7 · Storyboard",
-    8: "8 · Final Video",
-    9: "9 · Result",
+    1: "Select Videos",
+    2: "Context",
+    3: "Transcription",
+    4: "Frame Extraction",
+    5: "Frame Analysis",
+    6: "Context Review",
+    7: "Storyboard",
+    8: "Final Video",
+    9: "Result",
 }
+
+# Pixel gap between the nav icon and its label. Baked into the icon pixmap
+# as a transparent right margin so QToolButton renders it 1:1.
+ICON_TEXT_GAP = 8
 
 
 class AppShell(QMainWindow):
@@ -200,9 +208,15 @@ class AppShell(QMainWindow):
             btn.setProperty("active", False)
             btn.setText(NAV_LABELS[stage])
             btn.setFont(_icon_font(14))
-            # use a left icon via setText approach — keep simple text+emoji style
-            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-            btn.setFixedHeight(40)
+            # Material Symbols icon to the left of the label, with a small
+            # transparent right margin baked into the pixmap so there is a
+            # gap between the icon and the text.
+            icon_pix = _padded_nav_icon(NAV_ICONS[stage], 22,
+                                        ICON_TEXT_GAP, COLOR_ON_SURFACE)
+            btn.setIcon(QIcon(icon_pix))
+            btn.setIconSize(icon_pix.size())
+            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            btn.setFixedHeight(44)
             btn.setSizePolicy(btn.sizePolicy().Policy.Expanding,
                               btn.sizePolicy().Policy.Fixed)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -366,6 +380,25 @@ def _icon_font(size: int):
     f = QFont("Segoe UI", 10)
     f.setPixelSize(size)
     return f
+
+
+def _padded_nav_icon(name: str, glyph_size: int, gap: int, color: str) -> QPixmap:
+    """Build a nav icon pixmap with a transparent right margin.
+
+    Renders the Material Symbols glyph at ``glyph_size`` then composes it onto
+    a wider transparent canvas (``glyph_size + gap`` wide) so the glyph sits
+    at the left and the gap acts as spacing between the icon and the button
+    text. QToolButton has no icon-text gap property, so the margin is baked
+    into the pixmap and the icon size is set to the full padded width — Qt
+    renders it 1:1 (no scaling), keeping the glyph crisp.
+    """
+    glyph = material_icon_pixmap(name, glyph_size, color)
+    out = QPixmap(glyph.width() + gap, glyph.height())
+    out.fill(Qt.GlobalColor.transparent)
+    p = QPainter(out)
+    p.drawPixmap(0, 0, glyph)
+    p.end()
+    return out
 
 
 def _short_path(p: str, max_len: int = 28) -> str:

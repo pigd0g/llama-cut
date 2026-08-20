@@ -8,7 +8,12 @@ from PyQt6.QtWidgets import (
     QStyleOptionViewItem,
 )
 
-from ..theme import COLOR_BORDER, COLOR_ON_SURFACE, COLOR_ON_SURFACE_VARIANT
+from ..theme import (
+    COLOR_BORDER,
+    COLOR_ON_PRIMARY,
+    COLOR_ON_SURFACE,
+    COLOR_ON_SURFACE_VARIANT,
+)
 
 
 THUMB_W = 192
@@ -66,11 +71,14 @@ class ThumbDelegate(QStyledItemDelegate):
         # checkbox indicator (top-left)
         check_rect = QRect(thumb_rect.x() + 6, thumb_rect.y() + 6, 14, 14)
         is_selected = index.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked
-        painter.setBrush(_qcolor(option.palette, COLOR_ON_SURFACE if is_selected else COLOR_BORDER))
+        # Selected checkbox fill is green (#22c55e); the checkmark is drawn in
+        # the on-surface (dark) colour so it stays visible on the green fill.
+        COLOR_CHECK_SELECTED = "#22c55e"
+        painter.setBrush(_qcolor(option.palette, COLOR_CHECK_SELECTED if is_selected else COLOR_BORDER))
         painter.setPen(_qcolor(option.palette, COLOR_BORDER))
         painter.drawRect(check_rect)
         if is_selected:
-            painter.setPen(_qcolor(option.palette, COLOR_ON_SURFACE))
+            painter.setPen(_qcolor(option.palette, COLOR_ON_PRIMARY))
             painter.drawLine(check_rect.x() + 3, check_rect.y() + 7,
                              check_rect.x() + 6, check_rect.y() + 10)
             painter.drawLine(check_rect.x() + 6, check_rect.y() + 10,
