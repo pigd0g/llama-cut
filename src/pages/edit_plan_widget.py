@@ -55,12 +55,18 @@ _STATUS_COLORS = {
 
 _THUMB_W = 192   # 16:9 at 108px height
 _THUMB_H = 108
-# Beat card vertical budget. The annotation and info labels use elided
-# text so long content is cropped with an ellipsis rather than overflowing
-# the card border. The card height is driven by the thumbnail + fixed
-# label heights, not by the text length.
-_ANN_HEIGHT = 44    # annotation zone (purpose + description)
-_INFO_HEIGHT = 40   # beat id + source + time range
+# Beat card vertical budget. The annotation wraps (multi-line) but is
+# truncated to a char budget with an ellipsis so long descriptions don't
+# push the card height unbounded. The full text is available via the
+# tooltip on hover (set on the card frame so hovering anywhere works).
+_ANN_HEIGHT = 56    # annotation zone (purpose + description, wrapped)
+_INFO_HEIGHT = 52   # beat id + source + time range (3 HTML lines)
+_ANN_CHAR_LIMIT = 50  # max chars shown in the annotation before ellipsis
+_INFO_CHAR_LIMIT = 24  # max chars for source filename in the info label
+# Total card height = padding(8*2) + ann(56) + thumb(108) + info(52) + spacing(4*2) = 248
+# Scroll area needs card height + top/bottom margins (8*2) + a buffer so
+# the vertical scrollbar never appears.
+_SCROLL_MIN_HEIGHT = 248 + 16 + 12
 
 
 class EditPlanWidget(QWidget):
@@ -113,9 +119,10 @@ class EditPlanWidget(QWidget):
                 background: {COLOR_BORDER}; border-radius: 3px; min-width: 32px;
             }}
         """)
-        self.scroll.setMinimumHeight(_THUMB_H + _ANN_HEIGHT + _INFO_HEIGHT + 40)
+        self.scroll.setMinimumHeight(_SCROLL_MIN_HEIGHT)
         # No fixed height — let the strip scale with its contents, with a
-        # sensible minimum so single-beat plans don't look cramped.
+        # sensible minimum so single-beat plans don't look cramped and the
+        # vertical scrollbar never triggers.
 
         self._beats_container = QWidget()
         self._beats_container.setStyleSheet(f"background-color: {COLOR_SURFACE};")
@@ -205,10 +212,13 @@ class _BeatCard(QFrame):
         lay.setContentsMargins(SPACING_SM, SPACING_SM, SPACING_SM, SPACING_SM)
         lay.setSpacing(SPACING_XS)
 
-        # Annotation zone (top): elide long text so it doesn't overflow.
+        # Annotation zone (top): wrap to multiple lines but truncate to a
+        # char budget with an ellipsis so long descriptions don't grow the
+        # card unbounded. The full text is shown in the tooltip on hover.
         annotation = self._annotation_text()
-        ann_label = QLabel(self._elide(annotation, _THUMB_W, 2))
-        ann_label.setWordWrap(False)
+        truncated = self._truncate(annotation, _ANN_CHAR_LIMIT)
+        ann_label = QLabel(truncated)
+        ann_label.setWordWrap(True)
         ann_label.setStyleSheet(
             f"color: {COLOR_ON_SURFACE}; font-size: 12px; "
             f"background: transparent; border: none; padding: 0;"
@@ -229,35 +239,32 @@ class _BeatCard(QFrame):
         )
         lay.addWidget(self._thumb_label)
 
-        # Beat id + source + time range (bottom): elide each line.
+        # Beat id + source + time range (bottom): truncate the source name
+        # with an ellipsis; full source shown in the tooltip on hover.
         time_range = f"{self._beat.source_start:.1f}-{self._beat.source_end:.1f}s"
+        src_trunc = self._truncate(self._beat.source, _INFO_CHAR_LIMIT)
         info_label = QLabel(
             f"<b>{self._elide_html(self._beat.id, 20)}</b><br>"
             f"<span style='color: {COLOR_ON_SURFACE_VARIANT}; font-size: 11px;'>"
-            f"{self._elide_html(self._beat.source, 22)}</span><br>"
+            f"{self._elide_html(src_trunc, _INFO_CHAR_LIMIT)}</span><br>"
             f"<span style='color: {COLOR_ON_SURFACE_VARIANT}; font-size: 11px;'>"
             f"{time_range}</span>"
         )
         info_label.setStyleSheet("background: transparent; border: none; padding: 0;")
         info_label.setFixedHeight(_INFO_HEIGHT)
+        info_label.setToolTip(
+            f"{self._beat.id}\n{self._beat.source}\n{time_range}"
+        )
         lay.addWidget(info_label)
 
     @staticmethod
-    def _elide(text: str, width_px: int, lines: int = 1) -> str:
-        """Elide long text to fit within width_px, appending an ellipsis."""
+    def _truncate(text: str, max_chars: int) -> str:
+        """Truncate text to max_chars, appending an ellipsis if cut."""
         if not text:
             return ""
-        # Approximate: ~6px per char at 12px font. Add an ellipsis if too long.
-        max_chars = max(8, (width_px - 8) // 6)
         if len(text) <= max_chars:
             return text
-        if lines <= 1:
-            return text[:max_chars - 1] + "\u2026"
-        # Multi-line: allow up to lines * max_chars, then elide.
-        max_total = max_chars * lines
-        if len(text) <= max_total:
-            return text
-        return text[:max_total - 1] + "\u2026"
+        return text[:max_chars - 1] + "\u2026"
 
     @staticmethod
     def _elide_html(text: str, max_chars: int) -> str:

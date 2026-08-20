@@ -451,22 +451,27 @@ class ChatWidget(QWidget):
 
         # Send button (circular, Material Symbols arrow_upward icon)
         self.send_btn = QPushButton("arrow_upward")
+        self.send_btn.setObjectName("chatSendBtn")
         self.send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.send_btn.setFixedSize(36, 36)
         self.send_btn.setStyleSheet(f"""
-            QPushButton {{
+            QPushButton#chatSendBtn {{
                 background-color: {COLOR_PRIMARY};
                 color: {COLOR_ON_SURFACE};
                 border: none;
-                border-radius: {RADIUS_FULL}px;
+                border-radius: 18px;
                 font-family: 'Material Symbols Outlined';
                 font-size: 20px;
                 padding: 0px;
+                min-width: 36px;
+                max-width: 36px;
+                min-height: 36px;
+                max-height: 36px;
             }}
-            QPushButton:hover {{
+            QPushButton#chatSendBtn:hover {{
                 background-color: {COLOR_PRIMARY}cc;
             }}
-            QPushButton:disabled {{
+            QPushButton#chatSendBtn:disabled {{
                 background-color: {COLOR_SURFACE_CONTAINER};
                 color: {COLOR_ON_SURFACE_VARIANT};
             }}
