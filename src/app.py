@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
+    QPushButton,
     QStackedWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+from . import paths
 from .state import PipelineState
 from .theme import (
+    COLOR_DANGER,
     SPACING_LG,
     SPACING_MD,
     SPACING_SM,
@@ -136,6 +142,23 @@ class AppShell(QMainWindow):
         bl.addWidget(title)
         bl.addWidget(subtitle)
         lay.addWidget(brand)
+
+        # Hero image: scaled to the sidebar width, below the brand block.
+        img_path = Path(__file__).resolve().parent.parent / "assets" / "llama-edit-crew.png"
+        if img_path.exists():
+            hero = QLabel()
+            hero.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            pix = QPixmap(str(img_path))
+            if not pix.isNull():
+                # Sidebar is 240px; leave SPACING_MD on each side.
+                target_w = 240 - 2 * SPACING_MD
+                scaled = pix.scaledToWidth(
+                    target_w,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                hero.setPixmap(scaled)
+            lay.addWidget(hero)
+
         lay.addSpacing(SPACING_XL)
 
         self._nav_container = QWidget()
@@ -149,8 +172,25 @@ class AppShell(QMainWindow):
         self.folder_label = QLabel("No folder selected")
         self.folder_label.setProperty("class", "label-sm")
         self.folder_label.setWordWrap(True)
-        self.folder_label.setContentsMargins(SPACING_MD, 0, SPACING_MD, SPACING_MD)
+        self.folder_label.setContentsMargins(SPACING_MD, 0, SPACING_MD, 0)
         lay.addWidget(self.folder_label)
+
+        # Destructive cleanup: removes the .llama-cut folder + all subdirs.
+        self.cleanup_btn = QPushButton("Clean Up Project")
+        self.cleanup_btn.setObjectName("dangerButton")
+        self.cleanup_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cleanup_btn.setContentsMargins(SPACING_MD, 0, SPACING_MD, SPACING_MD)
+        self.cleanup_btn.setEnabled(False)
+        self.cleanup_btn.setStyleSheet(
+            f"QPushButton {{ color: {COLOR_DANGER}; "
+            f"background: transparent; border: none; "
+            f"text-align: left; padding: {SPACING_XS}px {SPACING_MD}px; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_DANGER}22; }}"
+            f"QPushButton:disabled {{ color: {COLOR_DANGER}66; }}"
+        )
+        self.cleanup_btn.clicked.connect(self._on_cleanup)
+        lay.addWidget(self.cleanup_btn)
+        lay.addSpacing(SPACING_MD)
         return bar
 
     def _build_nav_items(self) -> None:
@@ -183,6 +223,7 @@ class AppShell(QMainWindow):
         for i, btn in enumerate(self._nav_buttons):
             # Welcome (0) always enabled; stages need a folder
             btn.setEnabled(i == 0 or folder_set)
+        self.cleanup_btn.setEnabled(folder_set)
 
     # --- Signals ------------------------------------------------------------
     def _connect_signals(self) -> None:
@@ -202,6 +243,8 @@ class AppShell(QMainWindow):
             self._state.set_stage(1, force=True)
         else:
             self.folder_label.setText("No folder selected")
+            # No folder -> back to the Welcome / folder-picker screen.
+            self._state.set_stage(0, force=True)
 
     def _on_stage_changed(self, stage: int) -> None:
         if stage < 0 or stage >= self.stack.count():
@@ -210,7 +253,9 @@ class AppShell(QMainWindow):
         self._set_active_nav(stage)
         self._update_nav_enabled()
         # notify pages
-        if stage == 1:
+        if stage == 0:
+            self.welcome_page.on_enter()
+        elif stage == 1:
             self.stage1.refresh()
         elif stage == 2:
             self.context_page.on_enter()
@@ -240,6 +285,71 @@ class AppShell(QMainWindow):
         if not self._state.working_folder:
             return
         self._state.set_stage(stage)
+
+    def _on_cleanup(self) -> None:
+        """Destructive: delete the .llama-cut folder + all subdirs.
+
+        Prompts the user to confirm; on accept, removes the entire
+        ``.llama-cut`` tree under the working folder, resets in-memory state
+        (frames, settings, stage), and re-enters stage 1.
+        """
+        folder = self._state.working_folder
+        if not folder:
+            return
+        app_root = paths.app_root(folder)
+        if not app_root.exists():
+            # Nothing to delete — still reset state so the UI is consistent.
+            self._reset_after_cleanup(folder)
+            return
+
+        confirm = QMessageBox(
+            QMessageBox.Icon.Warning,
+            "Clean Up Project",
+            "This will permanently delete the .llama-cut folder and all of "
+            "its contents (context, transcription, frames, storyboard, and "
+            "rendered videos) for this project.\n\nThis cannot be undone. "
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            self,
+        )
+        confirm.setDefaultButton(QMessageBox.StandardButton.No)
+        # Style the Yes button as destructive (red text).
+        yes_btn = confirm.button(QMessageBox.StandardButton.Yes)
+        if yes_btn is not None:
+            yes_btn.setStyleSheet(f"color: {COLOR_DANGER}; font-weight: 600;")
+        if confirm.exec() != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            shutil.rmtree(app_root, ignore_errors=False)
+        except OSError as e:
+            QMessageBox.critical(
+                self,
+                "Clean Up Failed",
+                f"Could not remove the .llama-cut folder:\n\n{e}\n\n"
+                "Some files may be in use. Close them and try again.",
+            )
+            return
+
+        self._reset_after_cleanup(folder)
+
+    def _reset_after_cleanup(self, folder: str) -> None:
+        """Clear in-memory state and revert to the initial no-folder state.
+
+        The working folder must be cleared *first*: ``set_frames`` /
+        ``set_videos`` / ``set_stage`` each call :meth:`persist`, which writes
+        back to ``.llama-cut/app_state.json`` — and since the just-deleted
+        ``.llama-cut`` tree is gone, any persist while the working folder is
+        still set would *recreate* it. Clearing the folder first makes all
+        subsequent ``persist()`` calls no-op (they early-return on empty).
+        Then clearing the in-memory lists emits the changed signals so the
+        UI drops everything; the ``working_folder_changed("")`` signal runs
+        ``_on_folder_changed("")`` -> ``set_stage(0)`` -> Welcome page.
+        """
+        self._state.set_working_folder("")
+        self._state.set_frames([])
+        self._state.set_videos([])
+        self._state.set_stage(0, force=True)
 
     # --- Title --------------------------------------------------------------
     def _update_title(self) -> None:

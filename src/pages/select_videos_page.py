@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListView,
+    QMenu,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -22,6 +23,7 @@ from ..theme import (
     SPACING_SM,
 )
 from ..workers.thumbnail_worker import ThumbnailWorker
+from .video_preview import show_video_context_menu
 from .widgets import ThumbDelegate
 
 
@@ -96,6 +98,8 @@ class SelectVideosPage(QWidget):
         self.view.setProperty("class", "card")
         self.view.setFrameShape(QFrame.Shape.NoFrame)
         self.view.clicked.connect(self._on_item_clicked)
+        self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(self._on_context_menu)
         root.addWidget(self.view, 1)
 
         # Footer
@@ -205,6 +209,18 @@ class SelectVideosPage(QWidget):
                 break
         self._state.selection_changed.emit()
         self._state.persist()
+
+    def _on_context_menu(self, pos) -> None:
+        """Right-click on a thumbnail -> preview / open / copy path."""
+        idx = self.view.indexAt(pos)
+        if not idx.isValid():
+            return
+        path = idx.data(Qt.ItemDataRole.UserRole + 1)
+        if not path:
+            return
+        name = (idx.data(Qt.ItemDataRole.UserRole) or {}).get("title", "")
+        show_video_context_menu(path, name,
+                                self.view.viewport().mapToGlobal(pos), self)
 
     def _on_select_all(self) -> None:
         self._state.select_all()

@@ -35,6 +35,7 @@ from ..theme import (
     SPACING_MD,
     SPACING_SM,
 )
+from .video_preview import show_video_context_menu
 
 
 # Debounce window for autosave after the last keystroke (matches MarkdownEditor).
@@ -277,6 +278,12 @@ class ContextReviewPage(QWidget):
                     Qt.TransformationMode.SmoothTransformation,
                 )
                 thumb.setPixmap(scaled)
+        # Right-click on the thumbnail -> preview / open / copy path.
+        thumb.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        thumb.customContextMenuRequested.connect(
+            lambda pos, stem=v.stem, name=v.name, w=thumb:
+                self._on_thumb_context_menu(stem, name, pos, w)
+        )
         hdr.addWidget(thumb)
 
         name = QLabel(v.name)
@@ -310,6 +317,19 @@ class ContextReviewPage(QWidget):
         browser.setObjectName("rendered_view")
         editor.setObjectName("edit_view")
         return card
+
+    def _on_thumb_context_menu(self, stem: str, name: str, pos,
+                                thumb: QLabel) -> None:
+        """Right-click on a video thumbnail -> preview / open / copy path."""
+        # Resolve the actual file path from state by stem.
+        video = next(
+            (vv for vv in self._state.selected_videos if vv.stem == stem),
+            None,
+        )
+        if video is None:
+            return
+        show_video_context_menu(video.path, name,
+                                 thumb.mapToGlobal(pos), self)
 
     # --- Widget factory helpers --------------------------------------------
     def _make_text_browser(self, html: str) -> QTextBrowser:

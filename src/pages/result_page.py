@@ -40,19 +40,7 @@ from ..theme import (
 )
 from ..video_production import find_rendered_video, load_edit_plan
 from .context_review_page import _AutoTextBrowser
-
-
-def _format_time(ms: int) -> str:
-    """Render a millisecond position as M:SS (or H:MM:SS for long videos)."""
-    if ms < 0:
-        ms = 0
-    total_s = ms // 1000
-    h = total_s // 3600
-    m = (total_s % 3600) // 60
-    s = total_s % 60
-    if h > 0:
-        return f"{h}:{m:02d}:{s:02d}"
-    return f"{m}:{s:02d}"
+from .video_preview import _format_time
 
 
 class ResultPage(QWidget):

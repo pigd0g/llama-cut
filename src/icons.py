@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import QLabel
 
 from .theme import FONT_ICONS
@@ -21,3 +22,15 @@ def material_icon(name: str, size: int = 24, color: str | None = None) -> QLabel
     label = QLabel(name)
     label.setStyleSheet(style)
     return label
+
+
+def material_icon_pixmap(name: str, size: int = 24, color: str | None = None) -> QPixmap:
+    """Return a Material Symbols icon as a QPixmap (for use as a QIcon).
+
+    Renders the corresponding :func:`material_icon` QLabel via ``grab()``
+    so it can decorate a :class:`QAction`. The label is sized to its
+    :func:`sizeHint` before grabbing so the pixmap is not clipped.
+    """
+    label = material_icon(name, size, color)
+    label.setFixedSize(label.sizeHint())
+    return label.grab()

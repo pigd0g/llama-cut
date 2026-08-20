@@ -112,3 +112,13 @@ class WelcomePage(QWidget):
         # set_working_folder triggers _on_folder_changed in app.py which
         # loads state, refreshes stage 1, and forces the stage to 1.
         self._state.set_working_folder(folder)
+
+    def on_enter(self) -> None:
+        """Reset to the initial folder-picker state.
+
+        Called when the Welcome stage becomes active (e.g. after a project
+        clean-up). Restores the Select button and hides the loading indicator
+        left over from a previous folder selection.
+        """
+        self.select_btn.setEnabled(True)
+        self.loading_label.setVisible(False)

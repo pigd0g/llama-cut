@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
     QFrame,
@@ -29,6 +32,14 @@ from ..theme import (
 )
 from ..workers.extract_worker import ExtractWorker
 from ..workers.probe_worker import ProbeWorker
+from .video_preview import show_video_context_menu
+
+
+# Thumbnail column dimensions (matches the icon-grid aspect ratio).
+THUMB_COL_W = 116
+THUMB_CELL_W = 96
+THUMB_CELL_H = 54
+TABLE_ROW_H = 60
 
 
 class FrameGenerationPage(QWidget):
@@ -91,14 +102,18 @@ class FrameGenerationPage(QWidget):
         hdr = QLabel("Videos")
         hdr.setProperty("class", "headline-sm")
         lay.addWidget(hdr)
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
-            ["File", "Duration", "Resolution", "Codec", "Strategy"]
+            ["Thumbnail", "File", "Duration", "Resolution", "Codec", "Strategy"]
         )
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_context_menu)
+        # Fixed thumbnail column width; the rest size to contents.
+        self.table.setColumnWidth(0, THUMB_COL_W)
         self.table.horizontalHeader().setStretchLastSection(False)
         lay.addWidget(self.table)
         return card
@@ -247,17 +262,59 @@ class FrameGenerationPage(QWidget):
         for v in videos:
             row = self.table.rowCount()
             self.table.insertRow(row)
-            self.table.setItem(row, 0, QTableWidgetItem(v.name))
-            self.table.setItem(row, 1, QTableWidgetItem(_duration_label(v.duration)))
-            self.table.setItem(row, 2, QTableWidgetItem(
+            self.table.setRowHeight(row, TABLE_ROW_H)
+            # Column 0: thumbnail cell widget
+            self.table.setCellWidget(row, 0, self._make_thumb_cell(v))
+            # Columns 1-5: metadata
+            self.table.setItem(row, 1, QTableWidgetItem(v.name))
+            self.table.setItem(row, 2, QTableWidgetItem(_duration_label(v.duration)))
+            self.table.setItem(row, 3, QTableWidgetItem(
                 f"{v.width}x{v.height}" if v.width else "—"))
-            self.table.setItem(row, 3, QTableWidgetItem(v.codec or "—"))
+            self.table.setItem(row, 4, QTableWidgetItem(v.codec or "—"))
             decision = select_strategy(
                 self._current_mode(), v.duration, v.fps,
                 self.custom_spin.value(),
             )
-            self.table.setItem(row, 4, QTableWidgetItem(decision.label))
+            self.table.setItem(row, 5, QTableWidgetItem(decision.label))
         self.table.resizeColumnsToContents()
+        # Keep the thumbnail column at a fixed width after the resize-to-fit.
+        self.table.setColumnWidth(0, THUMB_COL_W)
+
+    def _make_thumb_cell(self, v) -> QLabel:
+        """Build a thumbnail QLabel for a table cell (or a placeholder)."""
+        thumb = QLabel()
+        thumb.setFixedSize(THUMB_CELL_W, THUMB_CELL_H)
+        thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        thumb.setStyleSheet("background: transparent; border: none;")
+        pix = QPixmap()
+        if v.thumbnail_path and Path(v.thumbnail_path).exists():
+            pix = QPixmap(v.thumbnail_path)
+        if pix.isNull():
+            thumb.setText("—")
+            thumb.setStyleSheet(
+                f"color: #9ca3b8; background-color: #1E2738; "
+                f"border: 1px solid #252D3D; border-radius: 4px;"
+            )
+        else:
+            scaled = pix.scaled(
+                THUMB_CELL_W, THUMB_CELL_H,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            thumb.setPixmap(scaled)
+        return thumb
+
+    def _on_context_menu(self, pos) -> None:
+        """Right-click on a row -> preview / open / copy path."""
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return
+        videos = self._state.selected_videos
+        if row >= len(videos):
+            return
+        v = videos[row]
+        show_video_context_menu(v.path, v.name,
+                                self.table.viewport().mapToGlobal(pos), self)
 
     # --- Settings -----------------------------------------------------------
     def _current_mode(self) -> str:

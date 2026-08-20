@@ -42,6 +42,7 @@ from ..transcription import (
 )
 from ..workers.model_download_worker import ModelDownloadWorker
 from ..workers.transcription_worker import TranscriptionWorker
+from .video_preview import show_video_context_menu
 from .widgets import ThumbDelegate
 
 
@@ -164,6 +165,8 @@ class TranscriptionPage(QWidget):
         self.view.setSelectionMode(QListView.SelectionMode.NoSelection)
         self.view.setFrameShape(QFrame.Shape.NoFrame)
         self.view.clicked.connect(self._on_item_clicked)
+        self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(self._on_context_menu)
         lay.addWidget(self.view)
         return card
 
@@ -377,6 +380,18 @@ class TranscriptionPage(QWidget):
         self._save_selected_paths()
         self._update_count()
         self._update_button_state()
+
+    def _on_context_menu(self, pos) -> None:
+        """Right-click on a thumbnail -> preview / open / copy path."""
+        idx = self.view.indexAt(pos)
+        if not idx.isValid():
+            return
+        path = idx.data(Qt.ItemDataRole.UserRole + 1)
+        if not path:
+            return
+        name = (idx.data(Qt.ItemDataRole.UserRole) or {}).get("title", "")
+        show_video_context_menu(path, name,
+                                self.view.viewport().mapToGlobal(pos), self)
 
     def _on_select_all(self) -> None:
         for row in range(self.model.rowCount()):

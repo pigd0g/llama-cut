@@ -32,6 +32,7 @@ from ..theme import (
     SPACING_XS,
 )
 from .markdown_editor import MarkdownEditor
+from .video_preview import show_video_context_menu
 
 
 THUMB_W = 64
@@ -226,10 +227,21 @@ class ContextPage(QWidget):
             row = _ScopeRow(v.name, subtitle, v.thumbnail_path,
                             is_project=False, video=v)
             row.clicked.connect(lambda _checked, vid=v: self._select_scope(vid))
+            row.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            row.customContextMenuRequested.connect(
+                lambda pos, vid=v, name=v.name: self._on_scope_context_menu(
+                    vid, name, pos, row
+                )
+            )
             self.scope_layout.addWidget(row)
             self._scope_rows.append(row)
 
         self.scope_layout.addStretch()
+
+    def _on_scope_context_menu(self, video: Video, name: str, pos, row) -> None:
+        """Right-click on a scope row -> preview / open / copy path."""
+        show_video_context_menu(video.path, name,
+                                 row.mapToGlobal(pos), self)
 
     def _ensure_project_editor(self) -> None:
         if self._project_editor is None:
