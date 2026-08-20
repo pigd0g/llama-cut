@@ -171,7 +171,14 @@ class VideoProductionWorker(QThread):
         # Add render preset instruction to the prompt
         user_prompt += (
             f"\n\n## Render Preset\n\n"
-            f"Use preset='{self._render_preset}' for the final render."
+            f"The default render preset is '{self._render_preset}'. "
+            f"Use this preset UNLESS the user's brief explicitly requests a "
+            f"different resolution (e.g. if the brief says '4K', use "
+            f"preset='youtube_4k' with format 3840x2160; if it says '1080p', "
+            f"use preset='youtube_1080p' with format 1920x1080). Always set "
+            f"the plan's `format` (width, height, fps) and `preset` fields to "
+            f"match the intended output, and pass matching values to "
+            f"render_video()."
         )
 
         if self._cancel:
@@ -229,12 +236,14 @@ class VideoProductionWorker(QThread):
                 storyboard_version=storyboard_version,
             )
             edit_plan.notes = final_text
-            edit_plan.preset = self._render_preset
+            if not edit_plan.preset:
+                edit_plan.preset = self._render_preset
             save_edit_plan(self._working_folder, edit_plan)
         else:
-            # Keep the committed plan authoritative; just record notes/preset.
+            # Keep the committed plan authoritative; just record notes.
+            # Only fall back to the UI preset if the agent never set one.
             edit_plan.notes = final_text
-            if self._render_preset:
+            if self._render_preset and not edit_plan.preset:
                 edit_plan.preset = self._render_preset
             save_edit_plan(self._working_folder, edit_plan)
 

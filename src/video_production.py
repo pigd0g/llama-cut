@@ -244,6 +244,22 @@ array of shot objects — never nest it under a key like `item`, `shots`, or \
 `metadata`. Do not include transition-only entries (source: "internal") in \
 the timeline; describe transitions in the separate `transitions` array.
 
+### Output Format (resolution / frame rate / preset)
+
+The Edit Plan has a `format` object (width, height, fps) and a `preset` field. \
+These MUST reflect the user's explicit requirements from the brief:
+- If the brief says "4k" or "4K" or "3840x2160", set format to \
+{width: 3840, height: 2160} and preset to "youtube_4k".
+- If the brief says "1080p" or "1920x1080", set format to \
+{width: 1920, height: 1080} and preset to "youtube_1080p".
+- If the brief specifies a frame rate (e.g. "60fps", "24fps"), set format.fps \
+accordingly; otherwise use the source frame rate or 30.0.
+- If the brief does not specify a resolution or frame rate, use the default \
+preset provided in the task (typically youtube_1080p / 30fps).
+- When calling render_video(), pass resolution and frame_rate that MATCH the \
+plan's format, and pass the matching preset. Never silently downgrade a 4K \
+request to 1080p.
+
 If inspect_clip later reveals that a boundary must change, call \
 update_edit_plan() with the corrected plan. You may also call \
 update_edit_plan() during execution if a tool result shows a range is wrong.
@@ -344,6 +360,9 @@ music unless the storyboard or user brief calls for it.
 problem rather than inventing a clip.
 - If something cannot be implemented, report it rather than silently \
 skipping it.
+- Honor explicit output-format requests from the user's brief (resolution, \
+frame rate, codec). If the brief asks for 4K, the plan's `format` MUST be \
+3840x2160 and `preset` MUST be "youtube_4k". Never silently downgrade.
 - Always probe a video before extracting clips from it.
 - Verify timestamps are within the video duration before extracting.
 - Use unique output_name values for every intermediate clip.

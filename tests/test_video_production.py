@@ -846,6 +846,7 @@ def test_supported_transitions_includes_common():
 def test_supported_presets_includes_common():
     assert "preview" in SUPPORTED_PRESETS
     assert "youtube_1080p" in SUPPORTED_PRESETS
+    assert "youtube_4k" in SUPPORTED_PRESETS
     assert "high_quality" in SUPPORTED_PRESETS
 
 
