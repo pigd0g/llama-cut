@@ -53,6 +53,10 @@ from ..theme import (
     SPACING_SM,
 )
 
+# Max consecutive auto-resumes after LLM-proposed fixes before requiring
+# manual intervention. Prevents an infinite failure→fix→fail loop.
+_MAX_AUTO_RESUMES = 30
+
 
 class VideoProductionPage(QWidget):
     """Stage 8 — build an edit plan via chat, then run it."""
@@ -67,6 +71,13 @@ class VideoProductionPage(QWidget):
         self._edit_plan: EditPlan | None = None
         self._chat_messages: list[ChatMessage] = []
         self._raw_chat_messages: list[dict] = []
+        # Auto-resume state: when the executor fails and the agent proposes a
+        # fix via update_edit_plan, we automatically re-run the plan without
+        # requiring the user to click "Run" again. Capped at _MAX_AUTO_RESUMES
+        # consecutive attempts to avoid an infinite failure→fix→fail loop.
+        self._auto_resume_pending: bool = False
+        self._auto_resume_has_fix: bool = False
+        self._auto_resume_count: int = 0
         self._build()
 
     # --- UI ----------------------------------------------------------------
@@ -253,6 +264,11 @@ class VideoProductionPage(QWidget):
         self.plan_widget.update_plan(plan)
         if plan and plan.timeline:
             self._extract_thumbnails()
+        # Track whether the agent produced a fix during a failure-recovery
+        # turn. _feed_failure_to_agent sets _auto_resume_pending=True; if the
+        # agent calls update_edit_plan during that turn, we auto-resume.
+        if self._auto_resume_pending:
+            self._auto_resume_has_fix = True
         self._reset_button_states()
 
     def _on_thinking_ended(self) -> None:
@@ -262,12 +278,45 @@ class VideoProductionPage(QWidget):
         if self._chat_worker is not None:
             self._raw_chat_messages = self._chat_worker.updated_messages
         self._reset_button_states()
+        # Auto-resume: if this turn was a failure-recovery turn and the agent
+        # proposed a fix (via update_edit_plan), re-run the edit plan
+        # automatically without requiring the user to click "Run" again.
+        if self._auto_resume_pending and self._auto_resume_has_fix:
+            self._auto_resume_pending = False
+            self._auto_resume_has_fix = False
+            if self._auto_resume_count < _MAX_AUTO_RESUMES:
+                self._auto_resume_count += 1
+                self.status_label.setText(
+                    f"Applying fix and resuming execution "
+                    f"(attempt {self._auto_resume_count}/{_MAX_AUTO_RESUMES})…"
+                )
+                self.status_label.setStyleSheet(
+                    f"color: {COLOR_ON_SURFACE_VARIANT};"
+                )
+                self._start_execution(self._edit_plan)
+            else:
+                self.status_label.setText(
+                    f"Auto-resume limit reached ({_MAX_AUTO_RESUMES} attempts). "
+                    f"Review the plan and click Run manually."
+                )
+                self.status_label.setStyleSheet(f"color: {COLOR_DANGER};")
+                self._auto_resume_count = 0
+        else:
+            # Not a failure-recovery turn, or the agent failed to produce a
+            # fix — clear the flags so a subsequent normal turn doesn't trip
+            # the auto-resume path.
+            self._auto_resume_pending = False
+            self._auto_resume_has_fix = False
 
     def _on_chat_error(self, msg: str) -> None:
         self.chat_widget.hide_thinking()
         self.chat_widget.set_input_enabled(True)
         self.status_label.setText(f"Chat error: {msg}")
         self.status_label.setStyleSheet(f"color: {COLOR_DANGER};")
+        # Clear auto-resume state — if the agent errored during a
+        # failure-recovery turn, don't auto-resume; let the user review.
+        self._auto_resume_pending = False
+        self._auto_resume_has_fix = False
         self._reset_button_states()
 
     # --- Execution failure feedback to agent --------------------------------
@@ -277,6 +326,12 @@ class VideoProductionPage(QWidget):
             return
         if not self._state.working_folder or self._store is None:
             return
+
+        # Mark this as a failure-recovery turn so _on_plan_updated and
+        # _on_thinking_ended can auto-resume execution once the agent
+        # proposes a fix via update_edit_plan.
+        self._auto_resume_pending = True
+        self._auto_resume_has_fix = False
 
         # Show a system message about the failure
         fail_msg = (
@@ -322,6 +377,9 @@ class VideoProductionPage(QWidget):
         if not self._state.working_folder:
             return
 
+        # A manual run resets the auto-resume counter.
+        self._auto_resume_count = 0
+
         plan = self._edit_plan
         beats = len(plan.timeline)
         cmds = len(plan.commands)
@@ -348,7 +406,16 @@ class VideoProductionPage(QWidget):
                 msg_box.clickedButton() is not approve_btn:
             return
 
-        # Mark plan as approved + start execution
+        self._start_execution(plan)
+
+    def _start_execution(self, plan: EditPlan) -> None:
+        """Mark the plan as approved and kick off the executor worker.
+
+        Called from ``_on_run`` (after the confirmation dialog) and from the
+        auto-resume path (after the agent proposes a fix). The auto-resume
+        path skips the confirmation dialog because the user already approved
+        the initial run.
+        """
         plan.status = "approved"
         from ..video_production import save_edit_plan
         save_edit_plan(self._state.working_folder, plan)
@@ -393,6 +460,9 @@ class VideoProductionPage(QWidget):
         self.status_label.setText("Video production complete.")
         self.status_label.setStyleSheet(f"color: {COLOR_SUCCESS};")
         self._edit_plan = plan
+        self._auto_resume_count = 0
+        self._auto_resume_pending = False
+        self._auto_resume_has_fix = False
         self._reset_button_states()
         # Auto-navigate to Result if a video was rendered
         if self._state.working_folder:
