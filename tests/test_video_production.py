@@ -540,7 +540,7 @@ def test_editing_system_prompt_no_execution_tools():
     # The system prompt should not reference the removed execution tools
     # as tools the agent calls (only as command types in the plan).
     # It's OK for them to appear as command type descriptions.
-    assert "You do NOT run ffmpeg" in EDITING_SYSTEM_PROMPT
+    assert "You do **NOT** run FFmpeg" in EDITING_SYSTEM_PROMPT
 
 
 # --- FFmpeg skill loading ----------------------------------------------------

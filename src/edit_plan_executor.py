@@ -25,6 +25,7 @@ import json
 import re
 import subprocess
 import time
+from collections import deque
 from pathlib import Path
 from typing import Callable
 
@@ -33,6 +34,7 @@ from .video_production import (
     CLIPS_SUBDIR,
     OUTPUT_SUBDIR,
     PRESET_PROFILES,
+    STAGE_WEIGHTS,
     SUPPORTED_PRESETS,
     SUPPORTED_TRANSITIONS,
     EditCommand,
@@ -48,6 +50,79 @@ from .video_production import (
 # --- Progress types ----------------------------------------------------------
 
 from dataclasses import dataclass, field
+
+
+# --- Intermediate encoder helper ---------------------------------------------
+# Intermediates are re-encoded in the final render, so prefer a fast preset.
+# Uses the same NVENC automatic fallback as the final render (see AGENTS.md):
+# if h264_nvenc is available, use it; otherwise libx264 ultrafast.
+
+def _intermediate_encoder_args() -> list[str]:
+    """Return encoder + args for an intermediate clip (fast, re-encodable).
+
+    Returns a list suitable for splicing into an ffmpeg command after the
+    filter/output args, e.g. ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "18"].
+    """
+    if is_nvenc_available():
+        return ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "18",
+                "-pix_fmt", "yuv420p"]
+    return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            "-pix_fmt", "yuv420p"]
+
+
+# --- Output extension validation ---------------------------------------------
+# Every ffmpeg output must carry a media extension (.mp4 etc.). The agent is
+# told this in the system prompt, and the executor enforces it here so an
+# extension-less output can never silently produce a file that downstream
+# discovery (find_rendered_video, validate) cannot find.
+
+_ALLOWED_OUTPUT_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
+
+
+def _has_media_extension(p: Path) -> bool:
+    """True if the path's suffix is a known media container extension."""
+    return p.suffix.lower() in _ALLOWED_OUTPUT_EXTS
+
+
+def _media_suffix(name: str) -> str:
+    """Return the media-extension suffix of a raw name ('' if none).
+
+    Used to keep a container extension out of _sanitize_name's stripping
+    path for render outputs; the executor rejects extension-less names via
+    the output-extension check in _run_command.
+    """
+    if _has_media_extension(Path(name)):
+        return Path(name).suffix.lower()
+    return ""
+
+
+def _as_bool(value: object, default: bool = False) -> bool:
+    """Robust boolean coercion for agent-supplied args (may be JSON strings)."""
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "off")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return default
+
+
+# --- Validate expectations ---------------------------------------------------
+
+@dataclass
+class ValidateExpectations:
+    """Expected properties for the final output, checked by validate."""
+    expected_resolution: str = ""   # "WIDTHxHEIGHT" e.g. "1920x1080"
+    expected_fps: float = 0.0       # 0 = don't check
+    expect_audio: bool = False      # if True, require an audio stream
+
+    @classmethod
+    def from_args(cls, args: dict) -> "ValidateExpectations":
+        return cls(
+            expected_resolution=str(args.get("expected_resolution", "") or ""),
+            expected_fps=float(args.get("expected_fps", 0.0) or 0.0),
+            expect_audio=_as_bool(args.get("expect_audio", False)),
+        )
 
 
 @dataclass
@@ -108,6 +183,8 @@ class EditPlanExecutor:
         self._is_cancelled = is_cancelled or (lambda: False)
         self._current_proc: subprocess.Popen | None = None
         self._intermediate_clips: dict[str, str] = {}
+        self._probe_cache: dict[str, float] = {}  # resolved path str -> duration
+        self._current_cmd_index: int = 0  # set per-iteration for progress emission
 
     def run(self) -> tuple[bool, CommandResult | None, list[CommandResult]]:
         """Execute all commands in the plan.
@@ -128,6 +205,7 @@ class EditPlanExecutor:
                 self._log("Aborted by user.")
                 return False, None, results
 
+            self._current_cmd_index = i
             stage = self._stage_for_command(cmd)
             self._emit(ExecutorProgress(
                 overall=completed_work / total_work if total_work > 0 else 0.0,
@@ -199,9 +277,19 @@ class EditPlanExecutor:
 
     def _run_command(self, cmd: EditCommand, stage: str,
                      completed_work: float, total_work: float) -> CommandResult:
-        """Run a single command, returning the result."""
+        """Run a single command, returning the result.
+
+        Builders return a 4-tuple:
+          (ffmpeg_cmd, out_path, checkpoint_path, fallback_cmd)
+        fallback_cmd is None except for assemble_timeline (no transitions),
+        which tries -c copy concat first then falls back to re-encode.
+        """
         start = time.time()
         try:
+            # validate is a special case: run ffprobe + parse + check expectations.
+            if cmd.type == "validate":
+                return self._run_validate(cmd, stage, completed_work, total_work, start)
+
             builder = _COMMAND_BUILDERS.get(cmd.type)
             if builder is None:
                 return CommandResult(
@@ -209,7 +297,19 @@ class EditPlanExecutor:
                     error=f"Unknown command type: {cmd.type}",
                     duration_s=time.time() - start,
                 )
-            ffmpeg_cmd, out_path, checkpoint_path = builder(cmd.args, self)
+            ffmpeg_cmd, out_path, checkpoint_path, fallback_cmd = builder(cmd.args, self)
+
+            # Output extension validation: every ffmpeg output must carry a
+            # media extension. Without it the file may render but be invisible
+            # to downstream discovery (find_rendered_video, validate).
+            if out_path and not _has_media_extension(out_path):
+                return CommandResult(
+                    cmd, False,
+                    error=("Output file must have a media extension (.mp4, .mov, .mkv, "
+                           f".avi, .webm, .m4v) — got '{out_path.name}'. Add the "
+                           "extension to the output_name."),
+                    duration_s=time.time() - start,
+                )
 
             # Checkpoint reuse: skip if the output already exists.
             if checkpoint_path is not None and checkpoint_path.exists():
@@ -218,8 +318,7 @@ class EditPlanExecutor:
                 return CommandResult(cmd, True, output_path=str(out_path or ""),
                                      skipped=True, duration_s=time.time() - start)
 
-            if out_path and not _is_safe_output_path(Path(out_path),
-                                                     out_path.parent if out_path else self._clips_dir):
+            if out_path and not _is_safe_output_path(out_path, self._working_folder):
                 return CommandResult(cmd, False,
                                      error="Output path escaped the project directory",
                                      duration_s=time.time() - start)
@@ -227,7 +326,17 @@ class EditPlanExecutor:
             rc, stdout, stderr = self._run_with_progress(
                 ffmpeg_cmd, cmd, stage, completed_work, total_work,
             )
+            if rc != 0 and fallback_cmd is not None and not self._is_cancelled():
+                # Primary failed; clean up any partial output before fallback.
+                self._cleanup_partial(out_path)
+                self._log(f"[fallback] {cmd.id} ({cmd.type}): primary failed, trying fallback")
+                rc, stdout, stderr = self._run_with_progress(
+                    fallback_cmd, cmd, stage, completed_work, total_work,
+                )
             if rc != 0:
+                # Clean up partial output on failure so checkpoint reuse can't
+                # pick up a corrupt/truncated file on re-run.
+                self._cleanup_partial(out_path)
                 return CommandResult(
                     cmd, False,
                     output_path=str(out_path) if out_path else "",
@@ -256,6 +365,93 @@ class EditPlanExecutor:
             return CommandResult(cmd, False, error=f"Executor error: {e}",
                                  duration_s=time.time() - start)
 
+    def _run_validate(self, cmd: EditCommand, stage: str,
+                      completed_work: float, total_work: float,
+                      start: float) -> CommandResult:
+        """Validate runs ffprobe and checks expected properties.
+
+        The builder returns an ffprobe command; here we run it and verify
+        expected_resolution, expected_fps, and expect_audio from cmd.args.
+        Validation always runs (no checkpoint reuse).
+        """
+        from .video_production import _ffprobe_bin
+        builder = _COMMAND_BUILDERS["validate"]
+        ffmpeg_cmd, _out, _ckpt, _fb = builder(cmd.args, self)
+        rc, stdout, stderr = self._run_with_progress(
+            ffmpeg_cmd, cmd, stage, completed_work, total_work,
+        )
+        if rc != 0:
+            return CommandResult(
+                cmd, False,
+                error=f"ffprobe exited with code {rc}",
+                stderr=stderr[:2000],
+                duration_s=time.time() - start,
+            )
+        expectations = ValidateExpectations.from_args(cmd.args)
+        if expectations.expected_resolution or expectations.expected_fps or expectations.expect_audio:
+            ok, message = self._check_validate_output(stdout, expectations)
+            if not ok:
+                return CommandResult(
+                    cmd, False,
+                    error=f"validation failed: {message}",
+                    stderr=stderr[:2000],
+                    duration_s=time.time() - start,
+                )
+        return CommandResult(
+            cmd, True,
+            output_path="",
+            stderr=stderr[:500],
+            duration_s=time.time() - start,
+        )
+
+    def _check_validate_output(self, ffprobe_stdout: str,
+                               expectations: ValidateExpectations) -> tuple[bool, str]:
+        """Parse ffprobe JSON stdout and verify it matches expectations."""
+        try:
+            data = json.loads(ffprobe_stdout)
+        except json.JSONDecodeError:
+            return False, "ffprobe output was not valid JSON"
+        if expectations.expect_audio:
+            has_audio = any(s.get("codec_type") == "audio"
+                            for s in data.get("streams", []))
+            if not has_audio:
+                return False, "expected an audio stream but none found"
+        if expectations.expected_fps:
+            for s in data.get("streams", []):
+                if s.get("codec_type") == "video":
+                    fps_expr = s.get("avg_frame_rate") or s.get("r_frame_rate") or "0/0"
+                    fps = _parse_fps_expr(fps_expr)
+                    if fps <= 0:
+                        return False, f"could not parse frame rate '{fps_expr}'"
+                    if abs(fps - expectations.expected_fps) > 0.5:
+                        return False, (f"frame rate {fps:.2f} does not match expected "
+                                       f"{expectations.expected_fps}")
+                    break
+        if expectations.expected_resolution:
+            try:
+                ew, eh = (int(x) for x in expectations.expected_resolution.lower().split("x"))
+            except (ValueError, AttributeError):
+                return False, f"invalid expected_resolution '{expectations.expected_resolution}'"
+            for s in data.get("streams", []):
+                if s.get("codec_type") == "video":
+                    w = int(s.get("width", 0))
+                    h = int(s.get("height", 0))
+                    if w != ew or h != eh:
+                        return False, (f"resolution {w}x{h} does not match expected "
+                                       f"{ew}x{eh}")
+                    break
+        return True, ""
+
+    def _cleanup_partial(self, out_path: Path | None) -> None:
+        """Delete a partial/truncated output file so it can't be reused as a checkpoint."""
+        if out_path is None:
+            return
+        try:
+            if out_path.exists():
+                out_path.unlink()
+        except OSError:
+            pass
+
     def _run_with_progress(self, ffmpeg_cmd: list[str], cmd: EditCommand,
                            stage: str, completed_work: float,
                            total_work: float) -> tuple[int, str, str]:
@@ -277,7 +473,8 @@ class EditPlanExecutor:
             return 127, "", str(e)
 
         input_duration = self._command_input_duration(cmd)
-        stderr_lines: list[str] = []
+        # Bound stderr accumulation: keep only the last 2000 lines (Phase 3.4).
+        stderr_lines: deque[str] = deque(maxlen=2000)
         time_re = re.compile(r"time=(\d+):(\d+):(\d+\.?\d*)")
 
         proc = self._current_proc
@@ -299,7 +496,7 @@ class EditPlanExecutor:
                         stage=stage,
                         stage_progress=frac,
                         command_id=cmd.id,
-                        command_index=0,
+                        command_index=self._current_cmd_index,
                         command_total=len(self._plan.commands),
                         message=f"{stage}: {cmd.type} ({cmd.id}) {int(frac * 100)}%",
                     ))
@@ -307,6 +504,8 @@ class EditPlanExecutor:
             # Wait for the process to finish and capture remaining output.
             remaining_stdout, remaining_stderr = proc.communicate()
             self._current_proc = None
+            # Partial-output cleanup on cancel/failure is handled by
+            # _run_command via _cleanup_partial (it sees the non-zero rc).
 
         rc = proc.returncode
         stdout = remaining_stdout or ""
@@ -329,7 +528,6 @@ class EditPlanExecutor:
         relevant video/clip duration in seconds (or 1.0 for count-based
         stages like validate).
         """
-        from .video_production import STAGE_WEIGHTS
         stage = self._stage_for_command(cmd)
         weight = STAGE_WEIGHTS.get(stage, 0.05)
         duration = self._command_input_duration(cmd)
@@ -373,16 +571,37 @@ class EditPlanExecutor:
         return 10.0
 
     def _probe_clip_duration(self, name: str) -> float:
-        """Probe the duration of an intermediate clip by name."""
+        """Probe the duration of an intermediate clip by name (cached)."""
         p = self._resolve_clip(name)
         if p is None:
             return 10.0
+        key = str(p)
+        cached = self._probe_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             from .ffmpeg.probe import run_ffprobe
             result = run_ffprobe(str(p))
-            return result.duration if result else 10.0
+            dur = result.duration if result else 10.0
         except Exception:
-            return 10.0
+            dur = 10.0
+        self._probe_cache[key] = dur
+        return dur
+
+    def _probe_clip_duration_from_path(self, p: Path) -> float:
+        """Probe the duration of a file by Path (cached)."""
+        key = str(p)
+        cached = self._probe_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            from .ffmpeg.probe import run_ffprobe
+            result = run_ffprobe(str(p))
+            dur = result.duration if result else 0.0
+        except Exception:
+            dur = 0.0
+        self._probe_cache[key] = dur
+        return dur
 
     def _sum_clip_durations(self, clip_names: list[str]) -> float:
         total = 0.0
@@ -445,17 +664,18 @@ def _build_extract_clip(args: dict, ex: EditPlanExecutor):
         # Let the ffmpeg call fail naturally with a clear error.
         src_path = Path(source)
     out_path = ex._clips_dir / f"{output_name}.mp4"
+    # Use -ss (input fast-seek) + -t DURATION (output option, version-unambiguous).
+    # -to after -ss is version-dependent; -t is consistent across ffmpeg versions.
+    duration = max(0.0, end - start)
     cmd = [
         _ffmpeg_bin(), "-hide_banner", "-y",
         "-ss", str(start),
-        "-to", str(end),
         "-i", str(src_path),
-        "-c:v", "libx264", "-crf", "18",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        str(out_path),
+        "-t", str(duration),
     ]
-    return cmd, out_path, out_path
+    cmd += _intermediate_encoder_args()
+    cmd += ["-c:a", "aac", str(out_path)]
+    return cmd, out_path, out_path, None
 
 
 def _build_create_edit(args: dict, ex: EditPlanExecutor):
@@ -468,6 +688,7 @@ def _build_create_edit(args: dict, ex: EditPlanExecutor):
 
     trim = args.get("trim")
     speed = float(args.get("speed", 1.0))
+    frame_rate = float(args.get("frame_rate", 0.0) or 0.0)
     crop = args.get("crop")
     scale = args.get("scale")
     aspect_ratio = args.get("aspect_ratio")
@@ -478,7 +699,18 @@ def _build_create_edit(args: dict, ex: EditPlanExecutor):
     af_parts: list[str] = []
     input_args: list[str] = []
     if trim:
-        input_args = ["-ss", str(trim.get("start", 0.0)), "-to", str(trim.get("end", 0.0))]
+        # -ss before -i (fast seek) + -t DURATION after -i (version-unambiguous).
+        trim_start = float(trim.get("start", 0.0))
+        trim_end = float(trim.get("end", 0.0))
+        input_args = ["-ss", str(trim_start), "-i", str(in_path),
+                      "-t", str(max(0.0, trim_end - trim_start))]
+    else:
+        input_args = ["-i", str(in_path)]
+    # Apply fps normalisation first so downstream transitions/assembly see
+    # a consistent frame rate (Phase 1.1; matches the system prompt's
+    # "explicitly normalise its frame rate" rule).
+    if frame_rate and frame_rate > 0:
+        vf_parts.append(f"fps={frame_rate}")
     if speed and speed != 1.0:
         vf_parts.append(f"setpts={1.0/speed:.4f}*PTS")
         atempo = speed
@@ -513,13 +745,13 @@ def _build_create_edit(args: dict, ex: EditPlanExecutor):
         if fo > 0:
             af_parts.append(f"afade=t=out:d={fo}")
 
-    cmd = [_ffmpeg_bin(), "-hide_banner", "-y"] + input_args + ["-i", str(in_path)]
+    cmd = [_ffmpeg_bin(), "-hide_banner", "-y"] + input_args
     if vf_parts:
         cmd += ["-vf", ",".join(vf_parts)]
     if af_parts:
         cmd += ["-af", ",".join(af_parts)]
-    cmd += ["-c:v", "libx264", "-crf", "18", "-c:a", "aac", str(out_path)]
-    return cmd, out_path, out_path
+    cmd += _intermediate_encoder_args() + ["-c:a", "aac", str(out_path)]
+    return cmd, out_path, out_path, None
 
 
 def _build_create_transition(args: dict, ex: EditPlanExecutor):
@@ -540,9 +772,8 @@ def _build_create_transition(args: dict, ex: EditPlanExecutor):
             "[0:v][1:v]concat=n=2:v=1:a=0[v];"
             "[0:a][1:a]concat=n=2:v=0:a=1[a]",
             "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-crf", "18", "-c:a", "aac",
-            str(out_path),
         ]
+        cmd += _intermediate_encoder_args() + ["-c:a", "aac", str(out_path)]
     else:
         dur_a = ex._probe_clip_duration(clip_a)
         offset = max(0.0, dur_a - duration)
@@ -553,10 +784,9 @@ def _build_create_transition(args: dict, ex: EditPlanExecutor):
             f"[0:v][1:v]xfade=transition={transition}:duration={duration}:offset={offset}[v];"
             f"[0:a][1:a]acrossfade=d={duration}[a]",
             "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-crf", "18", "-c:a", "aac",
-            str(out_path),
         ]
-    return cmd, out_path, out_path
+        cmd += _intermediate_encoder_args() + ["-c:a", "aac", str(out_path)]
+    return cmd, out_path, out_path, None
 
 
 def _build_assemble_timeline(args: dict, ex: EditPlanExecutor):
@@ -582,6 +812,13 @@ def _build_assemble_timeline(args: dict, ex: EditPlanExecutor):
             )
             filter_parts.append(f"[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[na{i}]")
         prev_v, prev_a = "[nv0]", "[na0]"
+        # Track the accumulated OUTPUT stream duration as transitions are
+        # chained (Phase 1.2). For xfade, the output of transition i is
+        #   accumulated_dur + dur_i - t_dur_i
+        # (the two clips overlap by t_dur_i). For concat (cut), it's additive:
+        #   accumulated_dur + dur_i
+        # Using individual clip durations for offsets is wrong for i>=2.
+        accumulated_dur = ex._probe_clip_duration(clips[0]) if clips else 0.0
         for i in range(1, len(clip_paths)):
             trans = transitions[i-1] if i-1 < len(transitions) else {"type": "cut", "duration": 0.0}
             t_type = trans.get("type", "cut")
@@ -594,33 +831,49 @@ def _build_assemble_timeline(args: dict, ex: EditPlanExecutor):
                     f"{prev_v}[nv{i}]concat=n=2:v=1:a=0{out_v};"
                     f"{prev_a}[na{i}]concat=n=2:v=0:a=1{out_a}"
                 )
+                accumulated_dur += ex._probe_clip_duration(clips[i])
             else:
-                dur_prev = ex._probe_clip_duration(clips[i-1])
-                offset = max(0.0, dur_prev - t_dur)
+                # xfade offset is the position in the ACCUMULATED output where
+                # clip i begins to cross-fade in. That's:
+                #   accumulated_dur - t_dur
+                # (the last t_dur seconds of the accumulated stream overlap
+                # with the first t_dur seconds of clip i).
+                offset = max(0.0, accumulated_dur - t_dur)
                 filter_parts.append(
                     f"{prev_v}[nv{i}]xfade=transition={t_type}:duration={t_dur}:offset={offset}{out_v};"
                     f"{prev_a}[na{i}]acrossfade=d={t_dur}{out_a}"
                 )
+                accumulated_dur += ex._probe_clip_duration(clips[i]) - t_dur
             prev_v, prev_a = out_v, out_a
         cmd = [_ffmpeg_bin(), "-hide_banner", "-y"] + input_args
         cmd += ["-filter_complex", ";".join(filter_parts)]
         cmd += ["-map", "[vout]", "-map", "[aout]"]
-        cmd += ["-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", str(out_path)]
+        cmd += _intermediate_encoder_args() + ["-c:a", "aac", str(out_path)]
+        fallback_cmd = None
     else:
+        # No transitions: try -c copy concat first (fast, lossless) with a
+        # re-encode fallback (Phase 2.4). All clips come from the same extract
+        # pipeline (libx264/aac/yuv420p), so -c copy should work when the agent
+        # has normalised correctly.
         concat_list = ex._clips_dir / f"{output_name}_concat.txt"
         with open(concat_list, "w", encoding="utf-8") as f:
             for p in clip_paths:
                 f.write(f"file '{p}'\n")
-        cmd = [
+        primary_cmd = [
             _ffmpeg_bin(), "-hide_banner", "-y",
             "-f", "concat", "-safe", "0",
             "-i", str(concat_list),
-            "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
+            "-c", "copy",
             str(out_path),
         ]
-    return cmd, out_path, out_path
+        fallback_cmd = [
+            _ffmpeg_bin(), "-hide_banner", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+        ]
+        fallback_cmd += _intermediate_encoder_args() + ["-c:a", "aac", str(out_path)]
+        cmd = primary_cmd
+    return cmd, out_path, out_path, fallback_cmd
 
 
 def _build_mix_audio(args: dict, ex: EditPlanExecutor):
@@ -628,11 +881,44 @@ def _build_mix_audio(args: dict, ex: EditPlanExecutor):
     audio_sources = args.get("audio_sources", [])
     volumes = args.get("volumes", [])
     fades = args.get("fades")
-    normalization = bool(args.get("normalization", False))
+    normalization = _as_bool(args.get("normalization", False))
+    loop = _as_bool(args.get("loop", True))  # default: loop short music
     video_path = ex._resolve_clip(video_clip) or ex._clips_dir / f"{video_clip}.mp4"
-    audio_paths = [ex._resolve_clip(a) for a in audio_sources]
+    # Resolve audio sources; raise on unresolvable rather than loading a wrong
+    # file (Phase 1.4 — was: `str(p or audio_sources[0])` which passed a bare
+    # filename and could load the wrong file).
+    audio_paths: list[Path] = []
+    for a in audio_sources:
+        p = ex._resolve_clip(a)
+        if p is None:
+            raise ValueError(
+                f"mix_audio: audio source '{a}' could not be resolved to a file"
+            )
+        audio_paths.append(p)
     output_name = _sanitize_name(video_clip) + "_mixed"
     out_path = ex._clips_dir / f"{output_name}.mp4"
+
+    # Phase 1.6: determine which audio sources need looping (shorter than
+    # the video). Use -stream_loop -1 before the -i for those inputs.
+    # With loop=false, a source shorter than the video is an error: the
+    # doc promises the command fails rather than leaving silence (and the
+    # agent gets the failure message back to propose a fix).
+    video_dur = ex._probe_clip_duration(video_clip)
+    input_args: list[str] = ["-i", str(video_path)]
+    for p in audio_paths:
+        audio_dur = ex._probe_clip_duration_from_path(p)
+        if loop:
+            if 0 < audio_dur < video_dur:
+                input_args += ["-stream_loop", "-1"]
+        else:
+            if 0 < audio_dur < video_dur:
+                raise ValueError(
+                    f"mix_audio: audio source '{p.name}' is shorter than the "
+                    f"edit ({audio_dur:.1f}s < {video_dur:.1f}s) and loop=false "
+                    "was requested; the track must cover the full edit or be "
+                    "looped (set loop: true)."
+                )
+        input_args += ["-i", str(p)]
 
     n_sources = len(audio_sources) + 1
     audio_labels = [f"[{i}:a]" for i in range(n_sources)]
@@ -657,13 +943,11 @@ def _build_mix_audio(args: dict, ex: EditPlanExecutor):
         filter_parts.append(f"{in_label}loudnorm=I=-16:TP=-1.5:LRA=11{fade_chain}")
     final_a_label = fade_chain if fade_chain != "[mixed]" else "[mixed]"
 
-    cmd = [_ffmpeg_bin(), "-hide_banner", "-y", "-i", str(video_path)]
-    for p in audio_paths:
-        cmd += ["-i", str(p or audio_sources[0])]
+    cmd = [_ffmpeg_bin(), "-hide_banner", "-y"] + input_args
     cmd += ["-filter_complex", ";".join(filter_parts)]
     cmd += ["-map", "0:v", "-map", final_a_label]
     cmd += ["-c:v", "copy", "-c:a", "aac", str(out_path)]
-    return cmd, out_path, out_path
+    return cmd, out_path, out_path, None
 
 
 def _build_render_video(args: dict, ex: EditPlanExecutor):
@@ -677,6 +961,11 @@ def _build_render_video(args: dict, ex: EditPlanExecutor):
     if preset not in SUPPORTED_PRESETS:
         preset = "youtube_1080p"
     in_path = ex._resolve_clip(timeline) or ex._clips_dir / f"{timeline}.mp4"
+    # Preserve an explicit container extension on the output (the executor's
+    # extension check then rejects a name with none). _sanitize_name strips
+    # trailing media extensions, so capture the suffix first and re-append it.
+    ext = _media_suffix(args.get("output_name", "final.mp4"))
+    output_name = _sanitize_name(args.get("output_name", "final.mp4")) + ext
     out_path = ex._output_dir / output_name
     profile = PRESET_PROFILES[preset]
     vf_parts = [f"scale={resolution.replace('x', ':')}", f"fps={frame_rate}"]
@@ -707,21 +996,26 @@ def _build_render_video(args: dict, ex: EditPlanExecutor):
         return c
 
     cmd = _build(vcodec)
-    return cmd, out_path, out_path
+    return cmd, out_path, out_path, None
 
 
 def _build_validate(args: dict, ex: EditPlanExecutor):
-    """Validate is a probe-only check — no ffmpeg transcode, just ffprobe."""
+    """Validate is a probe + expectations check (see _run_validate).
+
+    The builder produces the ffprobe command; _run_command dispatches
+    validate commands to _run_validate, which runs ffprobe and checks
+    expected_resolution, expected_fps, and expect_audio from args.
+    """
     target = args.get("target", "")
     kind = args.get("kind", "video")
-    # Use ffprobe via a simple command; success = file is valid.
     from .video_production import _ffprobe_bin
     p = ex._resolve_clip(target) or ex._output_dir / target
     if p is None or not p.exists():
         p = ex._clips_dir / target
-    cmd = [_ffprobe_bin(), "-hide_banner", "-show_format", "-show_streams", str(p)]
+    cmd = [_ffprobe_bin(), "-hide_banner", "-show_format", "-show_streams",
+           "-print_format", "json", str(p)]
     # No output file for validate; checkpoint = None so it always runs.
-    return cmd, None, None
+    return cmd, None, None, None
 
 
 _COMMAND_BUILDERS = {
@@ -742,7 +1036,7 @@ def render_command_as_string(cmd: EditCommand, executor: EditPlanExecutor | None
         return f"# unknown command type: {cmd.type}"
     try:
         ex = executor or EditPlanExecutor("", EditPlan(commands=[cmd]))
-        ffmpeg_cmd, _out, _ckpt = builder(cmd.args, ex)
+        ffmpeg_cmd, _out, _ckpt, _fb = builder(cmd.args, ex)
         return " ".join(_quote_arg(a) for a in ffmpeg_cmd)
     except Exception as e:
         return f"# error rendering command: {e}"
@@ -755,3 +1049,17 @@ def _quote_arg(arg: str) -> str:
     if any(c in arg for c in " \t\"'\\$`"):
         return f'"{arg}"'
     return arg
+
+
+def _parse_fps_expr(expr: str) -> float:
+    """Parse ffprobe frame-rate expressions like '30000/1001' or '25/1'."""
+    if not expr or expr == "0/0":
+        return 0.0
+    try:
+        if "/" in expr:
+            num, den = expr.split("/", 1)
+            n, d = float(num), float(den)
+            return n / d if d else 0.0
+        return float(expr)
+    except (ValueError, ZeroDivisionError):
+        return 0.0
