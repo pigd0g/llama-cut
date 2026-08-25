@@ -1005,13 +1005,35 @@ def _build_validate(args: dict, ex: EditPlanExecutor):
     The builder produces the ffprobe command; _run_command dispatches
     validate commands to _run_validate, which runs ffprobe and checks
     expected_resolution, expected_fps, and expect_audio from args.
+
+    `target` must name a real artifact file (a clip from this plan or the
+    final render). An empty target, a folder, or an unresolvable name fails
+    with a clear error — probing a directory would otherwise surface as a
+    confusing "Permission denied" on Windows.
     """
-    target = args.get("target", "")
-    kind = args.get("kind", "video")
+    target = str(args.get("target", "") or "").strip()
     from .video_production import _ffprobe_bin
-    p = ex._resolve_clip(target) or ex._output_dir / target
-    if p is None or not p.exists():
-        p = ex._clips_dir / target
+    p: Path | None = None
+    if target:
+        p = ex._resolve_clip(target)
+        if p is None:
+            # A render output lives in the output dir, usually with an
+            # explicit extension (e.g. "final.mp4").
+            cand = ex._output_dir / target
+            if cand.is_file():
+                p = cand
+        if p is None:
+            # A target that already carries an extension may be a clip name.
+            cand = ex._clips_dir / target
+            if cand.is_file():
+                p = cand
+    if p is None or not p.is_file() or not _has_media_extension(p):
+        raise ValueError(
+            f"validate: target '{target}' could not be resolved to a media "
+            f"file (expected a prior artifact name — the render output_name "
+            f"with its extension, or an extensionless intermediate clip "
+            f"name; never a folder or directory path)"
+        )
     cmd = [_ffprobe_bin(), "-hide_banner", "-show_format", "-show_streams",
            "-print_format", "json", str(p)]
     # No output file for validate; checkpoint = None so it always runs.

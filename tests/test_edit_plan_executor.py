@@ -559,6 +559,42 @@ def test_validate_returns_4_tuple(ex: EditPlanExecutor):
     assert len(result) == 4
 
 
+def test_validate_rejects_empty_target(ex: EditPlanExecutor):
+    """An empty/missing target must fail with a clear error, not probe a
+    directory (which would surface as a confusing 'Permission denied')."""
+    with pytest.raises(ValueError, match="could not be resolved"):
+        _build_validate({}, ex)
+
+
+def test_validate_rejects_directory_target(ex: EditPlanExecutor):
+    """Passing a folder (e.g. 'output') must fail before ffprobe runs."""
+    (ex._output_dir / "final.mp4").write_bytes(b"fake")
+    with pytest.raises(ValueError, match="could not be resolved"):
+        _build_validate({"target": "output"}, ex)  # the output DIRECTORY
+
+
+def test_validate_resolves_clip_by_name(ex_with_clips: EditPlanExecutor):
+    """An extensionless intermediate clip name resolves to the clips dir."""
+    cmd, _out, _ckpt, _fb = _build_validate(
+        {"target": "shot01"}, ex_with_clips,
+    )
+    assert "shot01.mp4" in cmd[-1]
+
+
+def test_validate_resolves_render_with_extension(ex: EditPlanExecutor):
+    """The final render resolves by its output_name with extension."""
+    (ex._output_dir / "final.mp4").write_bytes(b"fake")
+    cmd, _out, _ckpt, _fb = _build_validate({"target": "final.mp4"}, ex)
+    assert cmd[-1].endswith("final.mp4")
+
+
+def test_validate_resolves_extensionless_clip_in_clips_dir(ex: EditPlanExecutor):
+    """A bare clip name that exists in the clips dir also resolves."""
+    (ex._clips_dir / "timeline_v2.mp4").write_bytes(b"fake")
+    cmd, _out, _ckpt, _fb = _build_validate({"target": "timeline_v2.mp4"}, ex)
+    assert cmd[-1].endswith("timeline_v2.mp4")
+
+
 # --- ValidateExpectations ---------------------------------------------------
 
 def test_validate_expectations_from_args_defaults():

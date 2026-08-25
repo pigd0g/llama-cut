@@ -33,6 +33,7 @@ from src.video_production import (
     load_edit_plan,
     save_tool_log,
     load_tool_log,
+    load_tool_log_runs,
     load_tool_log_meta,
     save_chat,
     load_chat,
@@ -492,6 +493,46 @@ def test_tool_log_legacy_list_still_loads(tmp_working):
 
 def test_load_tool_log_meta_missing(tmp_working):
     assert load_tool_log_meta(str(tmp_working)) == {}
+
+
+def test_tool_log_appends_across_runs(tmp_working):
+    """The log is append-only: re-runs and restarts keep every prior run."""
+    run1 = {
+        "meta": {"plan_status": "failed", "total_commands": 1,
+                 "ran": 1, "succeeded": 0, "skipped": 0, "failed": 1,
+                 "not_run": 0, "timestamp": "t1"},
+        "entries": [
+            {"id": "c1", "type": "render_video", "status": "failed",
+             "command": "ffmpeg ...", "output_path": "", "error": "boom",
+             "stderr": "err", "duration_s": 1.0},
+        ],
+    }
+    run2 = {
+        "meta": {"plan_status": "rendered", "total_commands": 2,
+                 "ran": 2, "succeeded": 1, "skipped": 1, "failed": 0,
+                 "not_run": 0, "timestamp": "t2"},
+        "entries": [
+            {"id": "c1", "type": "render_video", "status": "done",
+             "command": "ffmpeg ...", "output_path": "final.mp4",
+             "error": "", "stderr": "", "duration_s": 2.0},
+            {"id": "c2", "type": "validate", "status": "skipped",
+             "command": "ffprobe ...", "output_path": "",
+             "error": "", "stderr": "", "duration_s": 0.0},
+        ],
+    }
+    save_tool_log(str(tmp_working), run1)
+    save_tool_log(str(tmp_working), run2)  # second run appends, doesn't replace
+
+    runs = load_tool_log_runs(str(tmp_working))
+    assert len(runs) == 2
+    assert runs[0]["meta"]["timestamp"] == "t1"
+    assert runs[1]["meta"]["timestamp"] == "t2"
+    # load_tool_log flattens all entries, oldest first.
+    entries = load_tool_log(str(tmp_working))
+    assert [e["id"] for e in entries] == ["c1", "c1", "c2"]
+    assert [e["status"] for e in entries] == ["failed", "done", "skipped"]
+    # Meta reflects the most recent run.
+    assert load_tool_log_meta(str(tmp_working))["plan_status"] == "rendered"
 
 
 def test_persist_exec_log_records_all_commands(tmp_working):

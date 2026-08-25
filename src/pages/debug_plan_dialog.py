@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..edit_plan_executor import EditPlanExecutor, render_command_as_string
-from ..video_production import load_tool_log, load_tool_log_meta
+from ..video_production import load_tool_log_runs
 from ..theme import (
     COLOR_BORDER,
     COLOR_ON_SURFACE,
@@ -200,8 +200,7 @@ class DebugPlanDialog(QDialog):
         log_lay.setContentsMargins(SPACING_MD, SPACING_MD, SPACING_MD, SPACING_MD)
         log_lay.setSpacing(SPACING_SM)
 
-        exec_log = load_tool_log(self._working_folder) if self._working_folder else []
-        log_meta = load_tool_log_meta(self._working_folder) if self._working_folder else {}
+        exec_runs = load_tool_log_runs(self._working_folder) if self._working_folder else []
 
         log_edit = QPlainTextEdit()
         log_edit.setReadOnly(True)
@@ -215,50 +214,62 @@ class DebugPlanDialog(QDialog):
                 padding: {SPACING_SM}px;
             }}
         """)
-        if exec_log:
+        if exec_runs:
             lines: list[str] = []
-            # Summary header: plan status + per-status counts.
-            if log_meta:
-                lines.append("=" * 78)
-                lines.append(
-                    f"EXECUTION SUMMARY — plan status: {log_meta.get('plan_status', '?')}"
-                    f"  ({log_meta.get('timestamp', '')})"
-                )
-                lines.append(
-                    f"  total: {log_meta.get('total_commands', len(exec_log))}  "
-                    f"ran: {log_meta.get('ran', '?')}  "
-                    f"done: {log_meta.get('succeeded', '?')}  "
-                    f"skipped: {log_meta.get('skipped', '?')}  "
-                    f"failed: {log_meta.get('failed', '?')}  "
-                    f"not run: {log_meta.get('not_run', '?')}"
-                )
-                lines.append("=" * 78)
-            for entry in exec_log:
-                status = entry.get("status", "?")
-                marker = {
-                    "done": "[OK]",
-                    "skipped": "[SKIP]",
-                    "failed": "[FAIL]",
-                    "not_run": "[NOT RUN]",
-                }.get(status, f"[{status.upper()}]")
-                lines.append(f"{'=' * 78}")
-                lines.append(
-                    f"{marker} {entry.get('id', '?')} ({entry.get('type', '?')}) — {status}"
-                    f"  ({entry.get('duration_s', 0)}s)"
-                )
-                beat = entry.get("beat_id")
-                if beat:
-                    lines.append(f"  beat: {beat}")
-                lines.append(f"  command: {entry.get('command', '')}")
-                if entry.get("output_path"):
-                    lines.append(f"  output: {entry.get('output_path', '')}")
-                if entry.get("error"):
-                    lines.append(f"  ERROR: {entry.get('error', '')}")
-                if entry.get("stderr"):
-                    lines.append("  stderr:")
-                    for sl in entry.get("stderr", "").splitlines():
-                        lines.append(f"    {sl}")
+            lines.append("=" * 78)
+            lines.append(f"EXECUTION LOG — {len(exec_runs)} run(s) recorded "
+                         f"(persisted across restarts and re-runs)")
+            lines.append("=" * 78)
+            for run_idx, run in enumerate(exec_runs, start=1):
+                entries = run.get("entries", [])
+                meta = run.get("meta", {})
                 lines.append("")
+                lines.append("-" * 78)
+                # Run summary header: plan status + per-status counts.
+                if meta:
+                    lines.append(
+                        f"RUN {run_idx} — plan status: {meta.get('plan_status', '?')}"
+                        f"  ({meta.get('timestamp', '')})"
+                    )
+                    lines.append(
+                        f"  total: {meta.get('total_commands', len(entries))}  "
+                        f"ran: {meta.get('ran', '?')}  "
+                        f"done: {meta.get('succeeded', '?')}  "
+                        f"skipped: {meta.get('skipped', '?')}  "
+                        f"failed: {meta.get('failed', '?')}  "
+                        f"not run: {meta.get('not_run', '?')}"
+                    )
+                else:
+                    lines.append(f"RUN {run_idx} — {len(entries)} command(s)")
+                lines.append("-" * 78)
+                if not entries:
+                    lines.append("  (no command records in this run)")
+                    continue
+                for entry in entries:
+                    status = entry.get("status", "?")
+                    marker = {
+                        "done": "[OK]",
+                        "skipped": "[SKIP]",
+                        "failed": "[FAIL]",
+                        "not_run": "[NOT RUN]",
+                    }.get(status, f"[{status.upper()}]")
+                    lines.append("")
+                    lines.append(
+                        f"{marker} {entry.get('id', '?')} ({entry.get('type', '?')}) — {status}"
+                        f"  ({entry.get('duration_s', 0)}s)"
+                    )
+                    beat = entry.get("beat_id")
+                    if beat:
+                        lines.append(f"  beat: {beat}")
+                    lines.append(f"  command: {entry.get('command', '')}")
+                    if entry.get("output_path"):
+                        lines.append(f"  output: {entry.get('output_path', '')}")
+                    if entry.get("error"):
+                        lines.append(f"  ERROR: {entry.get('error', '')}")
+                    if entry.get("stderr"):
+                        lines.append("  stderr:")
+                        for sl in entry.get("stderr", "").splitlines():
+                            lines.append(f"    {sl}")
             log_edit.setPlainText("\n".join(lines))
         else:
             log_edit.setPlainText("No commands have been executed yet. Run the edit plan to populate this log.")
@@ -269,7 +280,8 @@ class DebugPlanDialog(QDialog):
         _log_text = log_edit.toPlainText()
         copy_log_btn.clicked.connect(lambda: QApplication.clipboard().setText(_log_text))
         log_lay.addWidget(copy_log_btn)
-        tabs.addTab(log_tab, f"Execution Log ({len(exec_log)})")
+        total_entries = sum(len(r.get("entries", [])) for r in exec_runs)
+        tabs.addTab(log_tab, f"Execution Log ({len(exec_runs)} runs, {total_entries} cmds)")
 
         root.addWidget(tabs, 1)
 

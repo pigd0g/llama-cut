@@ -403,6 +403,33 @@ Rules:
 
 ---
 
+# validate
+
+`validate` runs ffprobe on a produced artifact and checks the expected properties in its args.
+
+```text
+{
+  target,
+  kind?,
+  expected_resolution?,   // e.g. "3840x2160"
+  expected_fps?,          // e.g. 59.94
+  expect_audio?           // bool — write true/false (or 1/0), never "yes"/"no"
+}
+```
+
+Rules:
+
+* The plan normally ends with a `validate` command targeting the final render.
+* `target` is an artifact **name**, never a folder or directory path:
+  * For the final render, use the render command's `output_name` **including the extension**, e.g. `"final.mp4"`.
+  * For an intermediate artifact, use the extensionless clip name, e.g. `"timeline_v2"`.
+  * Never pass a directory such as `"output"` — the executor resolves names against the artifact directories itself. Passing an empty target, a folder, or an unresolvable name fails the command with a clear error (probing a directory can surface as a confusing "Permission denied" on Windows).
+* If no render has been produced yet, `validate` may target the assembled timeline clip instead.
+* Set the expectations from the render command's `resolution`, `frame_rate`, and whether background music was mixed in.
+* The executor runs ffprobe and fails the command if the output does not match the expectations.
+
+---
+
 # Background Music
 
 Background music is a specific editorial requirement and must be handled deliberately.
@@ -1030,6 +1057,8 @@ Verify ALL of the following:
 * If background music is present, the final output is expected to contain audio.
 
 The `validate` command checks the final output against the `expected_resolution`, `expected_fps`, and `expect_audio` fields in its args. Set these from the render command's `resolution`, `frame_rate`, and whether background music was mixed in. The executor runs ffprobe and fails the command if the output does not match. Write booleans as `true`/`false` (or `1`/`0`) — never `"yes"`/`"no"` or other string variants.
+
+**`validate.target` must be an artifact NAME, never a path or folder**: for the final render use the render `output_name` with its extension (e.g. `"final.mp4"`); for an intermediate use the extensionless clip name (e.g. `"timeline_v2"`). Never pass a directory like `"output"` — the executor resolves names against the artifact directories itself, and probing a folder can surface as a confusing "Permission denied" on Windows.
 
 If any of these checks fail, fix the plan before committing it.
 
@@ -1845,51 +1874,81 @@ def load_edit_plan(working_folder: str) -> EditPlan | None:
 
 
 def save_tool_log(working_folder: str, log) -> Path:
-    """Persist the tool execution log to .llama-cut/video/tool_log.json.
+    """Append one execution run to the persistent tool log.
 
-    Accepts either the current format (a dict with "meta" + "entries") or a
-    plain list of entries (legacy callers).
+    The log is append-only across runs and restarts: every run of the edit
+    plan (each command with done/skipped/failed/not_run status) is kept so
+    failures can be debugged after later re-runs. Accepts the run format (a
+    dict with "meta" + "entries") or a plain list of entries (legacy).
     """
     d = _video_dir(working_folder)
     d.mkdir(parents=True, exist_ok=True)
     p = d / TOOL_LOG_FILENAME
-    p.write_text(json.dumps(log, indent=2), encoding="utf-8")
+    runs = _load_tool_log_runs_raw(p)
+    if isinstance(log, dict):
+        runs.append({"meta": log.get("meta", {}), "entries": log.get("entries", [])})
+    else:
+        runs.append({"meta": {}, "entries": list(log or [])})
+    p.write_text(json.dumps({"runs": runs}, indent=2), encoding="utf-8")
     return p
 
 
-def load_tool_log(working_folder: str) -> list[dict]:
-    """Load the tool log entries. Returns [] if not found.
+def _read_tool_log_raw(p: Path):
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
 
-    Handles both the current format ({"meta": ..., "entries": [...]}) and
-    the legacy plain-list format.
+
+def _load_tool_log_runs_raw(p: Path) -> list[dict]:
+    """Read the raw log file into a list of {meta, entries} runs.
+
+    Handles the current runs format, the older single-run format
+    ({"meta": ..., "entries": [...]}), and the legacy plain-list format.
+    """
+    data = _read_tool_log_raw(p)
+    if not isinstance(data, dict):
+        return [{"meta": {}, "entries": data or []}] if isinstance(data, list) else []
+    if isinstance(data.get("runs"), list):
+        return data["runs"]
+    if isinstance(data.get("entries"), list):
+        return [{"meta": data.get("meta", {}), "entries": data["entries"]}]
+    return []
+
+
+def load_tool_log_runs(working_folder: str) -> list[dict]:
+    """Load the full execution log as per-run blocks: [{"meta", "entries"}].
+
+    Every run of the edit plan is kept, oldest first. Returns [] if not found.
     """
     p = _video_dir(working_folder) / TOOL_LOG_FILENAME
     if not p.exists():
         return []
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return []
-    if isinstance(data, dict):
-        return data.get("entries", [])
-    return data if isinstance(data, list) else []
+    return _load_tool_log_runs_raw(p)
+
+
+def load_tool_log(working_folder: str) -> list[dict]:
+    """Load ALL execution-log entries across every recorded run.
+
+    Handles both the current format ({"meta": ..., "entries": [...]}) and
+    the legacy plain-list format. Entries are returned oldest-first.
+    """
+    runs = load_tool_log_runs(working_folder)
+    entries: list[dict] = []
+    for run in runs:
+        entries.extend(run.get("entries", []))
+    return entries
 
 
 def load_tool_log_meta(working_folder: str) -> dict:
-    """Load the tool log summary metadata (plan status, counts, timestamp).
+    """Load the summary metadata of the most recent run.
 
     Returns {} for a missing/legacy log.
     """
-    p = _video_dir(working_folder) / TOOL_LOG_FILENAME
-    if not p.exists():
+    runs = load_tool_log_runs(working_folder)
+    if not runs:
         return {}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
-    if isinstance(data, dict):
-        return data.get("meta", {})
-    return {}
+    return runs[-1].get("meta", {})
 
 
 def save_chat(working_folder: str, messages: list[dict]) -> Path:
