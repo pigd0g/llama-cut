@@ -144,16 +144,41 @@ def _ffprobe_bin() -> str:
 
 
 def is_nvenc_available() -> bool:
-    """Check whether h264_nvenc is available. Result is cached."""
+    """Check whether h264_nvenc is usable. Result is cached.
+
+    Two-stage check:
+      1. Quick listing probe: is h264_nvenc in `ffmpeg -encoders`?
+      2. Functional probe: can it actually encode a 64x64 test frame?
+
+    Stage 2 guards against binaries that list NVENC but whose GPU/driver
+    cannot encode (e.g. too-old GPU, missing driver, unsupported resolution).
+    A failure at either stage causes the entire pipeline to use libx264.
+
+    The env var LLAMACUT_DISABLE_NVENC=1 forces software encoding regardless
+    of probe results.
+    """
     global _NVENC_AVAILABLE
     if _NVENC_AVAILABLE is not None:
+        return _NVENC_AVAILABLE
+    if os.environ.get("LLAMACUT_DISABLE_NVENC", "").strip().lower() in ("1", "true", "yes"):
+        _NVENC_AVAILABLE = False
         return _NVENC_AVAILABLE
     try:
         proc = subprocess.run(
             [_ffmpeg_bin(), "-hide_banner", "-encoders"],
             capture_output=True, text=True, timeout=30, check=False,
         )
-        _NVENC_AVAILABLE = "h264_nvenc" in proc.stdout
+        if "h264_nvenc" not in proc.stdout:
+            _NVENC_AVAILABLE = False
+            return _NVENC_AVAILABLE
+        # Functional probe: can NVENC actually encode a tiny test frame?
+        proc2 = subprocess.run(
+            [_ffmpeg_bin(), "-hide_banner", "-y",
+             "-f", "lavfi", "-i", "color=size=64x64:duration=1",
+             "-c:v", "h264_nvenc", "-f", "null", "-"],
+            capture_output=True, timeout=30, check=False,
+        )
+        _NVENC_AVAILABLE = proc2.returncode == 0
     except Exception:
         _NVENC_AVAILABLE = False
     return _NVENC_AVAILABLE

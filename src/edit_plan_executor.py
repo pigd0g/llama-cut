@@ -54,20 +54,41 @@ from dataclasses import dataclass, field
 
 # --- Intermediate encoder helper ---------------------------------------------
 # Intermediates are re-encoded in the final render, so prefer a fast preset.
-# Uses the same NVENC automatic fallback as the final render (see AGENTS.md):
-# if h264_nvenc is available, use it; otherwise libx264 ultrafast.
+# NVENC detection means a *successful probe*, not just presence in -encoders
+# (see is_nvenc_available in video_production.py). If a listed-but-broken
+# NVENC cannot encode a test frame, every builder falls back to libx264.
+# Set LLAMACUT_DISABLE_NVENC=1 to force software encoding regardless.
+
+def _nvenc_intermediate_args() -> list[str]:
+    """NVENC-fast args for intermediate clips."""
+    return ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "18",
+            "-pix_fmt", "yuv420p"]
+
+
+def _sw_intermediate_args() -> list[str]:
+    """Software-fast args for intermediate clips."""
+    return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            "-pix_fmt", "yuv420p"]
+
 
 def _intermediate_encoder_args() -> list[str]:
     """Return encoder + args for an intermediate clip (fast, re-encodable).
 
     Returns a list suitable for splicing into an ffmpeg command after the
     filter/output args, e.g. ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "18"].
+    Prefers NVENC when the probe succeeds; falls back to libx264 otherwise.
     """
     if is_nvenc_available():
-        return ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "18",
-                "-pix_fmt", "yuv420p"]
-    return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
-            "-pix_fmt", "yuv420p"]
+        return _nvenc_intermediate_args()
+    return _sw_intermediate_args()
+
+
+def _intermediate_fallback_args() -> list[str] | None:
+    """Return software encoder args for use as a fallback, or None if the
+    primary already uses software (nothing to fall back to)."""
+    if is_nvenc_available():
+        return _sw_intermediate_args()
+    return None
 
 
 # --- Output extension validation ---------------------------------------------
@@ -675,7 +696,16 @@ def _build_extract_clip(args: dict, ex: EditPlanExecutor):
     ]
     cmd += _intermediate_encoder_args()
     cmd += ["-c:a", "aac", str(out_path)]
-    return cmd, out_path, out_path, None
+    fallback_cmd = None
+    sw_fallback = _intermediate_fallback_args()
+    if sw_fallback is not None:
+        fallback_cmd = [
+            _ffmpeg_bin(), "-hide_banner", "-y",
+            "-ss", str(start),
+            "-i", str(src_path),
+            "-t", str(duration),
+        ] + sw_fallback + ["-c:a", "aac", str(out_path)]
+    return cmd, out_path, out_path, fallback_cmd
 
 
 def _build_create_edit(args: dict, ex: EditPlanExecutor):
@@ -751,7 +781,16 @@ def _build_create_edit(args: dict, ex: EditPlanExecutor):
     if af_parts:
         cmd += ["-af", ",".join(af_parts)]
     cmd += _intermediate_encoder_args() + ["-c:a", "aac", str(out_path)]
-    return cmd, out_path, out_path, None
+    fallback_cmd = None
+    sw_fallback = _intermediate_fallback_args()
+    if sw_fallback is not None:
+        fallback_cmd = [_ffmpeg_bin(), "-hide_banner", "-y"] + input_args
+        if vf_parts:
+            fallback_cmd += ["-vf", ",".join(vf_parts)]
+        if af_parts:
+            fallback_cmd += ["-af", ",".join(af_parts)]
+        fallback_cmd += sw_fallback + ["-c:a", "aac", str(out_path)]
+    return cmd, out_path, out_path, fallback_cmd
 
 
 def _build_create_transition(args: dict, ex: EditPlanExecutor):
@@ -765,28 +804,46 @@ def _build_create_transition(args: dict, ex: EditPlanExecutor):
     out_path = ex._clips_dir / f"{output_name}.mp4"
 
     if transition == "cut":
+        filter_str = ("[0:v][1:v]concat=n=2:v=1:a=0[v];"
+                      "[0:a][1:a]concat=n=2:v=0:a=1[a]")
         cmd = [
             _ffmpeg_bin(), "-hide_banner", "-y",
             "-i", str(path_a), "-i", str(path_b),
-            "-filter_complex",
-            "[0:v][1:v]concat=n=2:v=1:a=0[v];"
-            "[0:a][1:a]concat=n=2:v=0:a=1[a]",
+            "-filter_complex", filter_str,
             "-map", "[v]", "-map", "[a]",
         ]
         cmd += _intermediate_encoder_args() + ["-c:a", "aac", str(out_path)]
+        fallback_cmd = None
+        sw_fallback = _intermediate_fallback_args()
+        if sw_fallback is not None:
+            fallback_cmd = [
+                _ffmpeg_bin(), "-hide_banner", "-y",
+                "-i", str(path_a), "-i", str(path_b),
+                "-filter_complex", filter_str,
+                "-map", "[v]", "-map", "[a]",
+            ] + sw_fallback + ["-c:a", "aac", str(out_path)]
     else:
         dur_a = ex._probe_clip_duration(clip_a)
         offset = max(0.0, dur_a - duration)
+        filter_str = (f"[0:v][1:v]xfade=transition={transition}:duration={duration}:offset={offset}[v];"
+                      f"[0:a][1:a]acrossfade=d={duration}[a]")
         cmd = [
             _ffmpeg_bin(), "-hide_banner", "-y",
             "-i", str(path_a), "-i", str(path_b),
-            "-filter_complex",
-            f"[0:v][1:v]xfade=transition={transition}:duration={duration}:offset={offset}[v];"
-            f"[0:a][1:a]acrossfade=d={duration}[a]",
+            "-filter_complex", filter_str,
             "-map", "[v]", "-map", "[a]",
         ]
         cmd += _intermediate_encoder_args() + ["-c:a", "aac", str(out_path)]
-    return cmd, out_path, out_path, None
+        fallback_cmd = None
+        sw_fallback = _intermediate_fallback_args()
+        if sw_fallback is not None:
+            fallback_cmd = [
+                _ffmpeg_bin(), "-hide_banner", "-y",
+                "-i", str(path_a), "-i", str(path_b),
+                "-filter_complex", filter_str,
+                "-map", "[v]", "-map", "[a]",
+            ] + sw_fallback + ["-c:a", "aac", str(out_path)]
+    return cmd, out_path, out_path, fallback_cmd
 
 
 def _build_assemble_timeline(args: dict, ex: EditPlanExecutor):
@@ -850,6 +907,12 @@ def _build_assemble_timeline(args: dict, ex: EditPlanExecutor):
         cmd += ["-map", "[vout]", "-map", "[aout]"]
         cmd += _intermediate_encoder_args() + ["-c:a", "aac", str(out_path)]
         fallback_cmd = None
+        sw_fallback = _intermediate_fallback_args()
+        if sw_fallback is not None:
+            fallback_cmd = [_ffmpeg_bin(), "-hide_banner", "-y"] + input_args
+            fallback_cmd += ["-filter_complex", ";".join(filter_parts)]
+            fallback_cmd += ["-map", "[vout]", "-map", "[aout]"]
+            fallback_cmd += sw_fallback + ["-c:a", "aac", str(out_path)]
     else:
         # No transitions: try -c copy concat first (fast, lossless) with a
         # re-encode fallback (Phase 2.4). All clips come from the same extract
@@ -996,7 +1059,12 @@ def _build_render_video(args: dict, ex: EditPlanExecutor):
         return c
 
     cmd = _build(vcodec)
-    return cmd, out_path, out_path, None
+    # If the primary encoder is NVENC, build a libx264 fallback so a
+    # runtime GPU/driver failure still produces a valid render.
+    fallback_cmd = None
+    if vcodec.startswith(("h264_nvenc", "hevc_nvenc")):
+        fallback_cmd = _build(sw_vcodec)
+    return cmd, out_path, out_path, fallback_cmd
 
 
 def _build_validate(args: dict, ex: EditPlanExecutor):
