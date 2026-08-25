@@ -14,6 +14,8 @@ Signals:
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from ..edit_plan_executor import (
@@ -123,21 +125,43 @@ class EditExecutorWorker(QThread):
         self.finished_success.emit(self._plan)
 
     def _persist_exec_log(self, results: list) -> None:
-        """Save a plain-text ffmpeg execution log to tool_log.json.
+        """Save the complete ffmpeg execution log to tool_log.json.
 
-        Each entry records the command id, type, status, the rendered ffmpeg
-        command line, the output path, the error (if any), and the stderr
-        excerpt. The Debug modal loads this to show what actually ran.
+        Every command in the plan is recorded — done, skipped, failed, and
+        not_run (commands the run never reached because an earlier one
+        failed or the run was aborted) — so the Debug modal shows the full
+        picture for analysis. Each entry carries the rendered ffmpeg command
+        line, output path, error, stderr, and duration.
         """
         ex = self._executor
-        log: list[dict] = []
-        for r in results:
-            cmd = r.command
+        by_id = {r.command.id: r for r in results}
+        entries: list[dict] = []
+        for cmd in self._plan.commands:
+            r = by_id.get(cmd.id)
+            if r is None:
+                # Never reached: an earlier command failed or the run was
+                # aborted before this one started.
+                try:
+                    cmd_str = render_command_as_string(cmd, ex)
+                except Exception:
+                    cmd_str = f"# {cmd.type} ({cmd.id})"
+                entries.append({
+                    "id": cmd.id,
+                    "type": cmd.type,
+                    "beat_id": cmd.beat_id,
+                    "status": "not_run",
+                    "command": cmd_str,
+                    "output_path": "",
+                    "error": "",
+                    "stderr": "",
+                    "duration_s": 0.0,
+                })
+                continue
             try:
                 cmd_str = render_command_as_string(cmd, ex)
             except Exception:
                 cmd_str = f"# {cmd.type} ({cmd.id})"
-            log.append({
+            entries.append({
                 "id": cmd.id,
                 "type": cmd.type,
                 "beat_id": cmd.beat_id,
@@ -148,6 +172,19 @@ class EditExecutorWorker(QThread):
                 "stderr": r.stderr or "",
                 "duration_s": round(r.duration_s, 2),
             })
+        log = {
+            "meta": {
+                "plan_status": self._plan.status,
+                "total_commands": len(self._plan.commands),
+                "ran": sum(1 for e in entries if e["status"] != "not_run"),
+                "succeeded": sum(1 for e in entries if e["status"] == "done"),
+                "skipped": sum(1 for e in entries if e["status"] == "skipped"),
+                "failed": sum(1 for e in entries if e["status"] == "failed"),
+                "not_run": sum(1 for e in entries if e["status"] == "not_run"),
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            },
+            "entries": entries,
+        }
         try:
             save_tool_log(self._working_folder, log)
         except Exception:

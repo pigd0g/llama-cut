@@ -277,13 +277,99 @@ def find_frame_filenames_in_frame_analysis(frame_analysis_md: str) -> list[str]:
 
 # --- Minimal markdown → HTML converter --------------------------------------
 
+# GFM table detection: a row is a line containing at least one pipe; a table
+# starts when a row is immediately followed by a separator row (| --- | --- |).
+_TABLE_ROW_RE = re.compile(r"^\s*\|?.*\|.*$")
+_TABLE_SEP_RE = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
+
+
+def _is_table_separator(line: str) -> bool:
+    """True if `line` is a GFM table separator row (e.g. '| --- | :---: |')."""
+    return bool(_TABLE_SEP_RE.match(line)) and "-" in line
+
+
+def _split_table_cells(row: str) -> list[str]:
+    """Split a GFM table row into cells, honouring escaped pipes (\\|)."""
+    s = row.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    cells: list[str] = []
+    cur: list[str] = []
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\" and i + 1 < len(s) and s[i + 1] == "|":
+            cur.append("|")
+            i += 2
+            continue
+        if ch == "|":
+            cells.append("".join(cur).strip())
+            cur = []
+            i += 1
+            continue
+        cur.append(ch)
+        i += 1
+    cells.append("".join(cur).strip())
+    return cells
+
+
+def _table_alignments(sep: str) -> list[str]:
+    """Derive per-column alignment from a separator row's colons."""
+    out: list[str] = []
+    for cell in _split_table_cells(sep):
+        c = cell.strip()
+        if c.startswith(":") and c.endswith(":"):
+            out.append("center")
+        elif c.endswith(":"):
+            out.append("right")
+        elif c.startswith(":"):
+            out.append("left")
+        else:
+            out.append("")
+    return out
+
+
+def _cell_style(aligns: list[str], k: int) -> str:
+    if k < len(aligns) and aligns[k]:
+        return f' style="text-align:{aligns[k]};"'
+    return ""
+
+
+def _render_table(lines: list[str], start: int) -> tuple[str, int]:
+    """Render a GFM table whose header row is at `start`.
+
+    Returns (html, next_index) where next_index is the first line after the
+    table (a blank line or a non-table line).
+    """
+    header = _split_table_cells(lines[start])
+    aligns = _table_alignments(lines[start + 1])
+    body: list[list[str]] = []
+    j = start + 2
+    while j < len(lines) and _TABLE_ROW_RE.match(lines[j].rstrip()):
+        body.append(_split_table_cells(lines[j]))
+        j += 1
+    parts = ['<table border="1" cellspacing="0" cellpadding="4">', "<thead><tr>"]
+    for k, cell in enumerate(header):
+        parts.append(f"<th{_cell_style(aligns, k)}>{_inline(cell)}</th>")
+    parts.append("</tr></thead><tbody>")
+    for row in body:
+        parts.append("<tr>")
+        for k, cell in enumerate(row):
+            parts.append(f"<td{_cell_style(aligns, k)}>{_inline(cell)}</td>")
+        parts.append("</tr>")
+    parts.append("</tbody></table>")
+    return "".join(parts), j
+
+
 def markdown_to_html(md: str, frame_paths_by_filename: Optional[dict] = None
                      ) -> str:
     """Convert the assembled markdown to HTML for QTextBrowser.
 
-    Handles: H1/H2/H3, paragraphs, unordered/ordered lists, bold, italic,
-    inline code, and frame image insertion (after `## Frame <filename> —`
-    headings in the Frame Analysis section).
+    Handles: H1/H2/H3, paragraphs, unordered/ordered lists, GFM tables,
+    bold, italic, inline code, and frame image insertion (after
+    `## Frame <filename> —` headings in the Frame Analysis section).
 
     `frame_paths_by_filename` maps frame filename → absolute path on disk.
     When provided and a frame file exists, an <img> tag is inserted after
@@ -296,6 +382,7 @@ def markdown_to_html(md: str, frame_paths_by_filename: Optional[dict] = None
     html_parts: list[str] = []
     in_list: Optional[str] = None  # "ul" or "ol"
     para_lines: list[str] = []
+    skip_until: int = -1  # lines consumed by a table render
 
     def flush_paragraph() -> None:
         if para_lines:
@@ -310,7 +397,9 @@ def markdown_to_html(md: str, frame_paths_by_filename: Optional[dict] = None
             html_parts.append(f"</{in_list}>")
             in_list = None
 
-    for line in lines:
+    for i, line in enumerate(lines):
+        if i < skip_until:
+            continue
         stripped = line.rstrip()
 
         # Headings
@@ -342,6 +431,15 @@ def markdown_to_html(md: str, frame_paths_by_filename: Optional[dict] = None
             flush_paragraph()
             flush_list()
             html_parts.append(f"<h1>{_inline(stripped[2:].strip())}</h1>")
+            continue
+
+        # GFM table: a row followed by a separator row.
+        if _TABLE_ROW_RE.match(stripped) and i + 1 < len(lines) \
+                and _is_table_separator(lines[i + 1].rstrip()):
+            flush_paragraph()
+            flush_list()
+            table_html, skip_until = _render_table(lines, i)
+            html_parts.append(table_html)
             continue
 
         # Lists

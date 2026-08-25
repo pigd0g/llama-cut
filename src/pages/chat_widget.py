@@ -20,10 +20,11 @@ from __future__ import annotations
 
 import json
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEasingCurve, Qt, QTimer, QPropertyAnimation, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
@@ -184,7 +185,13 @@ class UserRow(_ChatRow):
 # --- Thinking row (pulsing dots) ----------------------------------------------
 
 class ThinkingRow(_ChatRow):
-    """Left-aligned row with bold sender label + animated pulsing dots."""
+    """Left-aligned row with bold sender label + animated pulsing dots.
+
+    The three dots are real widgets whose opacity is animated with
+    QPropertyAnimation (Qt's rich-text engine ignores CSS opacity, so the
+    old HTML-span approach rendered static dots). Each dot pulses on a
+    staggered phase so the row reads as a continuous "working" wave.
+    """
 
     def __init__(self, sender: str = "assistant", parent=None):
         super().__init__(parent)
@@ -198,41 +205,43 @@ class ThinkingRow(_ChatRow):
         )
         lay.addWidget(label)
 
-        self._dots_label = QLabel("•    •    •")
-        self._dots_label.setStyleSheet(
-            f"color: {COLOR_ON_SURFACE_VARIANT}; font-size: 18px; "
-            f"font-weight: 700; padding: {SPACING_SM}px {SPACING_MD}px;"
-        )
-        lay.addWidget(self._dots_label)
+        dots_row = QHBoxLayout()
+        dots_row.setContentsMargins(SPACING_MD, SPACING_SM, SPACING_MD, SPACING_SM)
+        dots_row.setSpacing(6)
+        self._dots: list[QLabel] = []
+        self._effects: list[QGraphicsOpacityEffect] = []
+        self._animations: list[QPropertyAnimation] = []
+        for _ in range(3):
+            dot = QLabel("●")
+            dot.setStyleSheet(
+                f"color: {COLOR_PRIMARY}; font-size: 18px; font-weight: 700;"
+            )
+            effect = QGraphicsOpacityEffect(dot)
+            effect.setOpacity(0.3)
+            dot.setGraphicsEffect(effect)
+            dots_row.addWidget(dot)
+            self._dots.append(dot)
+            self._effects.append(effect)
+        dots_row.addStretch()
+        lay.addLayout(dots_row)
 
-        self._timer = QTimer(self)
-        self._timer.setInterval(400)
-        self._frame = 0
-        self._timer.timeout.connect(self._animate)
-        self._timer.start()
-
-    def _animate(self) -> None:
-        """Cycle dot opacities to create a pulsing wave effect."""
-        intensities = [
-            [1.0, 0.3, 0.3],
-            [0.6, 1.0, 0.3],
-            [0.3, 0.6, 1.0],
-        ]
-        i = self._frame % len(intensities)
-        row = intensities[i]
-        # Render each dot with its opacity via a simple HTML span approach.
-        dots_html = (
-            f"<span style='opacity:{row[0]:.1f};color:{COLOR_ON_SURFACE}'>●</span>"
-            f"&nbsp;&nbsp;"
-            f"<span style='opacity:{row[1]:.1f};color:{COLOR_ON_SURFACE}'>●</span>"
-            f"&nbsp;&nbsp;"
-            f"<span style='opacity:{row[2]:.1f};color:{COLOR_ON_SURFACE}'>●</span>"
-        )
-        self._dots_label.setText(dots_html)
-        self._frame += 1
+        # Staggered pulse: each dot fades 0.3 -> 1.0 -> 0.3 over 900ms,
+        # offset by 300ms so the wave travels left to right.
+        for i, effect in enumerate(self._effects):
+            anim = QPropertyAnimation(effect, b"opacity", self)
+            anim.setStartValue(0.3)
+            anim.setKeyValueAt(0.5, 1.0)
+            anim.setEndValue(0.3)
+            anim.setDuration(900)
+            anim.setLoopCount(-1)
+            anim.setEasingCurve(QEasingCurve.Type.InOutSine)
+            anim.start()
+            self._animations.append(anim)
+            QTimer.singleShot(i * 300, anim.start)
 
     def stop(self) -> None:
-        self._timer.stop()
+        for anim in self._animations:
+            anim.stop()
 
 
 # --- Tool chip row (expandable) -----------------------------------------------
@@ -367,6 +376,11 @@ def _estimate_browser_height(browser: QTextBrowser, content: str) -> int:
 
 # --- Chat widget ---------------------------------------------------------------
 
+# Default starter prompt pre-populated in the input box so the user can send
+# it as-is or edit it first.
+DEFAULT_PROMPT = "develop and edit a plan for the storyboard"
+
+
 class ChatWidget(QWidget):
     """Full chat UI: scrollable message list + floating input bar.
 
@@ -435,7 +449,10 @@ class ChatWidget(QWidget):
 
         # Text input
         self.input = QPlainTextEdit()
-        self.input.setPlaceholderText("Type a message...  (Ctrl+Enter to send)")
+        self.input.setPlaceholderText("develop an edit plan for the storyboard")
+        # Pre-populate the default starter prompt so the user can send it
+        # as-is or edit it first.
+        self.input.setPlainText(DEFAULT_PROMPT)
         self.input.setStyleSheet(f"""
             QPlainTextEdit {{
                 background: transparent;
@@ -456,7 +473,7 @@ class ChatWidget(QWidget):
         self.send_btn.setFixedSize(36, 36)
         self.send_btn.setStyleSheet(f"""
             QPushButton#chatSendBtn {{
-                background-color: {COLOR_PRIMARY};
+                background-color: {COLOR_PRIMARY_CONTAINER};
                 color: {COLOR_ON_SURFACE};
                 border: none;
                 border-radius: 18px;
@@ -467,9 +484,6 @@ class ChatWidget(QWidget):
                 max-width: 36px;
                 min-height: 36px;
                 max-height: 36px;
-            }}
-            QPushButton#chatSendBtn:hover {{
-                background-color: {COLOR_PRIMARY}cc;
             }}
             QPushButton#chatSendBtn:disabled {{
                 background-color: {COLOR_SURFACE_CONTAINER};
@@ -564,6 +578,8 @@ class ChatWidget(QWidget):
             w = item.widget()
             if w is not None:
                 w.deleteLater()
+        # Restore the default starter prompt for a fresh conversation.
+        self.input.setPlainText(DEFAULT_PROMPT)
 
     def set_input_enabled(self, enabled: bool) -> None:
         """Enable/disable the input + send button (e.g. while thinking)."""
@@ -592,4 +608,7 @@ class ChatWidget(QWidget):
         if not text:
             return
         self.input.clear()
+        # Re-populate the default prompt so the next message is one keystroke
+        # away instead of starting from an empty box.
+        self.input.setPlainText(DEFAULT_PROMPT)
         self.message_sent.emit(text)

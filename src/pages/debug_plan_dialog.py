@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..edit_plan_executor import EditPlanExecutor, render_command_as_string
-from ..video_production import load_tool_log
+from ..video_production import load_tool_log, load_tool_log_meta
 from ..theme import (
     COLOR_BORDER,
     COLOR_ON_SURFACE,
@@ -201,6 +201,7 @@ class DebugPlanDialog(QDialog):
         log_lay.setSpacing(SPACING_SM)
 
         exec_log = load_tool_log(self._working_folder) if self._working_folder else []
+        log_meta = load_tool_log_meta(self._working_folder) if self._working_folder else {}
 
         log_edit = QPlainTextEdit()
         log_edit.setReadOnly(True)
@@ -216,11 +217,35 @@ class DebugPlanDialog(QDialog):
         """)
         if exec_log:
             lines: list[str] = []
+            # Summary header: plan status + per-status counts.
+            if log_meta:
+                lines.append("=" * 78)
+                lines.append(
+                    f"EXECUTION SUMMARY — plan status: {log_meta.get('plan_status', '?')}"
+                    f"  ({log_meta.get('timestamp', '')})"
+                )
+                lines.append(
+                    f"  total: {log_meta.get('total_commands', len(exec_log))}  "
+                    f"ran: {log_meta.get('ran', '?')}  "
+                    f"done: {log_meta.get('succeeded', '?')}  "
+                    f"skipped: {log_meta.get('skipped', '?')}  "
+                    f"failed: {log_meta.get('failed', '?')}  "
+                    f"not run: {log_meta.get('not_run', '?')}"
+                )
+                lines.append("=" * 78)
             for entry in exec_log:
                 status = entry.get("status", "?")
-                marker = "[OK]" if status == "done" else ("[SKIP]" if status == "skipped" else "[FAIL]")
+                marker = {
+                    "done": "[OK]",
+                    "skipped": "[SKIP]",
+                    "failed": "[FAIL]",
+                    "not_run": "[NOT RUN]",
+                }.get(status, f"[{status.upper()}]")
                 lines.append(f"{'=' * 78}")
-                lines.append(f"{marker} {entry.get('id', '?')} ({entry.get('type', '?')}) — {status}  ({entry.get('duration_s', 0)}s)")
+                lines.append(
+                    f"{marker} {entry.get('id', '?')} ({entry.get('type', '?')}) — {status}"
+                    f"  ({entry.get('duration_s', 0)}s)"
+                )
                 beat = entry.get("beat_id")
                 if beat:
                     lines.append(f"  beat: {beat}")
@@ -230,12 +255,8 @@ class DebugPlanDialog(QDialog):
                 if entry.get("error"):
                     lines.append(f"  ERROR: {entry.get('error', '')}")
                 if entry.get("stderr"):
-                    stderr = entry.get("stderr", "")
-                    # Show up to 1500 chars of stderr to keep the log readable.
-                    if len(stderr) > 1500:
-                        stderr = stderr[:1500] + "\n  ... (truncated)"
-                    lines.append(f"  stderr:")
-                    for sl in stderr.splitlines():
+                    lines.append("  stderr:")
+                    for sl in entry.get("stderr", "").splitlines():
                         lines.append(f"    {sl}")
                 lines.append("")
             log_edit.setPlainText("\n".join(lines))

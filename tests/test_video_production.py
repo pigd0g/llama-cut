@@ -33,6 +33,7 @@ from src.video_production import (
     load_edit_plan,
     save_tool_log,
     load_tool_log,
+    load_tool_log_meta,
     save_chat,
     load_chat,
     clear_production,
@@ -442,6 +443,89 @@ def test_save_and_load_tool_log(tmp_working):
 
 def test_load_tool_log_missing(tmp_working):
     assert load_tool_log(str(tmp_working)) == []
+
+
+def test_tool_log_roundtrip_new_format(tmp_working):
+    """The current format is {meta, entries}; entries load, meta loads."""
+    log = {
+        "meta": {
+            "plan_status": "failed",
+            "total_commands": 3,
+            "ran": 2,
+            "succeeded": 1,
+            "skipped": 0,
+            "failed": 1,
+            "not_run": 1,
+            "timestamp": "2026-08-25T12:00:00",
+        },
+        "entries": [
+            {"id": "c1", "type": "extract_clip", "status": "done",
+             "command": "ffmpeg ...", "output_path": "x.mp4",
+             "error": "", "stderr": "", "duration_s": 1.0},
+            {"id": "c2", "type": "render_video", "status": "failed",
+             "command": "ffmpeg ...", "output_path": "",
+             "error": "boom", "stderr": "error line", "duration_s": 2.0},
+            {"id": "c3", "type": "validate", "status": "not_run",
+             "command": "ffprobe ...", "output_path": "",
+             "error": "", "stderr": "", "duration_s": 0.0},
+        ],
+    }
+    save_tool_log(str(tmp_working), log)
+    loaded = load_tool_log(str(tmp_working))
+    assert len(loaded) == 3
+    assert [e["status"] for e in loaded] == ["done", "failed", "not_run"]
+    meta = load_tool_log_meta(str(tmp_working))
+    assert meta["plan_status"] == "failed"
+    assert meta["not_run"] == 1
+
+
+def test_tool_log_legacy_list_still_loads(tmp_working):
+    """Old plain-list logs keep working (backward compat)."""
+    save_tool_log(str(tmp_working), [
+        {"id": "c1", "type": "extract_clip", "status": "done",
+         "command": "ffmpeg ...", "output_path": "x.mp4",
+         "error": "", "stderr": "", "duration_s": 1.0},
+    ])
+    assert len(load_tool_log(str(tmp_working))) == 1
+    assert load_tool_log_meta(str(tmp_working)) == {}
+
+
+def test_load_tool_log_meta_missing(tmp_working):
+    assert load_tool_log_meta(str(tmp_working)) == {}
+
+
+def test_persist_exec_log_records_all_commands(tmp_working):
+    """The execution log covers every plan command: done, skipped, failed, not_run."""
+    from PyQt6.QtCore import QCoreApplication
+    QCoreApplication.instance() or QCoreApplication([])
+    from src.workers.edit_executor_worker import EditExecutorWorker
+    from src.edit_plan_executor import CommandResult
+
+    plan = EditPlan(commands=[
+        EditCommand(id="c1", type="extract_clip", args={"output_name": "a"}),
+        EditCommand(id="c2", type="extract_clip", args={"output_name": "b"}),
+        EditCommand(id="c3", type="render_video", args={"output_name": "final.mp4"}),
+    ])
+    worker = EditExecutorWorker(str(tmp_working), plan)
+    worker._executor = MagicMock()
+    results = [
+        CommandResult(plan.commands[0], True, output_path="a.mp4", duration_s=1.0),
+        CommandResult(plan.commands[1], False, error="boom", stderr="err", duration_s=2.0),
+        # c3 never ran (run halted on c2's failure)
+    ]
+    worker._persist_exec_log(results)
+
+    entries = load_tool_log(str(tmp_working))
+    assert [e["status"] for e in entries] == ["done", "failed", "not_run"]
+    assert entries[2]["id"] == "c3"
+    assert entries[2]["command"]  # rendered command line present even for not_run
+    meta = load_tool_log_meta(str(tmp_working))
+    assert meta["total_commands"] == 3
+    assert meta["ran"] == 2
+    assert meta["succeeded"] == 1
+    assert meta["failed"] == 1
+    assert meta["not_run"] == 1
+    assert meta["plan_status"] == "draft"
 
 
 def test_save_and_load_chat(tmp_working):

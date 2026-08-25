@@ -1844,8 +1844,12 @@ def load_edit_plan(working_folder: str) -> EditPlan | None:
         return None
 
 
-def save_tool_log(working_folder: str, log: list[dict]) -> Path:
-    """Persist the tool execution log to .llama-cut/video/tool_log.json."""
+def save_tool_log(working_folder: str, log) -> Path:
+    """Persist the tool execution log to .llama-cut/video/tool_log.json.
+
+    Accepts either the current format (a dict with "meta" + "entries") or a
+    plain list of entries (legacy callers).
+    """
     d = _video_dir(working_folder)
     d.mkdir(parents=True, exist_ok=True)
     p = d / TOOL_LOG_FILENAME
@@ -1854,14 +1858,38 @@ def save_tool_log(working_folder: str, log: list[dict]) -> Path:
 
 
 def load_tool_log(working_folder: str) -> list[dict]:
-    """Load the tool log. Returns [] if not found."""
+    """Load the tool log entries. Returns [] if not found.
+
+    Handles both the current format ({"meta": ..., "entries": [...]}) and
+    the legacy plain-list format.
+    """
     p = _video_dir(working_folder) / TOOL_LOG_FILENAME
     if not p.exists():
         return []
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return []
+    if isinstance(data, dict):
+        return data.get("entries", [])
+    return data if isinstance(data, list) else []
+
+
+def load_tool_log_meta(working_folder: str) -> dict:
+    """Load the tool log summary metadata (plan status, counts, timestamp).
+
+    Returns {} for a missing/legacy log.
+    """
+    p = _video_dir(working_folder) / TOOL_LOG_FILENAME
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if isinstance(data, dict):
+        return data.get("meta", {})
+    return {}
 
 
 def save_chat(working_folder: str, messages: list[dict]) -> Path:
