@@ -339,6 +339,84 @@ def test_markdown_to_html_empty():
     assert markdown_to_html("") == ""
 
 
+# --- GFM tables --------------------------------------------------------------
+
+def test_markdown_to_html_table_basic():
+    md = (
+        "| Shot | Source | Duration |\n"
+        "| --- | --- | --- |\n"
+        "| Hook | GX012053.MP4 | 10s |\n"
+        "| B-roll | GX012054.MP4 | 8s |"
+    )
+    html = markdown_to_html(md)
+    assert "<table" in html
+    assert "<thead>" in html
+    assert "<tbody>" in html
+    assert "<th>Shot</th>" in html
+    assert "<th>Source</th>" in html
+    assert "<td>Hook</td>" in html
+    assert "<td>GX012053.MP4</td>" in html
+    assert "<td>B-roll</td>" in html
+    # No stray paragraph wrapping the table rows.
+    assert "<p>| Shot" not in html
+
+
+def test_markdown_to_html_table_inline_formatting():
+    md = (
+        "| Scene | Notes |\n"
+        "| --- | --- |\n"
+        "| 1 | **Opening** hook |\n"
+        "| 2 | `cut` on beat |"
+    )
+    html = markdown_to_html(md)
+    assert "<strong>Opening</strong>" in html
+    assert "<code>cut</code>" in html
+
+
+def test_markdown_to_html_table_alignment():
+    md = (
+        "| Left | Center | Right |\n"
+        "| :--- | :---: | ---: |\n"
+        "| a | b | c |"
+    )
+    html = markdown_to_html(md)
+    assert 'text-align:left' in html
+    assert 'text-align:center' in html
+    assert 'text-align:right' in html
+
+
+def test_markdown_to_html_table_escaped_pipe():
+    md = (
+        "| Name | Value |\n"
+        "| --- | --- |\n"
+        "| a\\|b | 1 |"
+    )
+    html = markdown_to_html(md)
+    assert "<td>a|b</td>" in html
+
+
+def test_markdown_to_html_table_surrounded_by_paragraphs():
+    md = (
+        "Intro text.\n\n"
+        "| A | B |\n"
+        "| --- | --- |\n"
+        "| 1 | 2 |\n\n"
+        "Outro text."
+    )
+    html = markdown_to_html(md)
+    assert "<p>Intro text.</p>" in html
+    assert "<table" in html
+    assert "<p>Outro text.</p>" in html
+
+
+def test_markdown_to_html_pipe_line_without_separator_is_paragraph():
+    """A pipe line that isn't followed by a separator row stays a paragraph."""
+    md = "Just a | pipe line"
+    html = markdown_to_html(md)
+    assert "<table" not in html
+    assert "<p>Just a | pipe line</p>" in html
+
+
 # --- build_export_markdown --------------------------------------------------
 
 def test_build_export_markdown_structure(tmp_path):

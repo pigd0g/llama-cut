@@ -138,6 +138,10 @@ class SelectVideosPage(QWidget):
                 v.height = old.height
                 v.codec = old.codec
                 v.fps = old.fps
+                # Carry the thumbnail across rescans so a video whose card
+                # already has one doesn't re-run ffmpeg (and so a stale
+                # state entry that forgot it can pick it up again).
+                v.thumbnail_path = old.thumbnail_path
         self._state.set_videos(videos)
         self._populate()
         self._start_thumbnails()
@@ -200,7 +204,11 @@ class SelectVideosPage(QWidget):
     # --- Thumbnails ---------------------------------------------------------
     def _start_thumbnails(self) -> None:
         if self._thumb_worker and self._thumb_worker.isRunning():
-            self._thumb_worker.cancel()
+            # Kill the in-flight ffmpeg before starting a replacement: a
+            # superseded worker that keeps running would race the new one
+            # writing the same .jpg (that is what left the first video's
+            # thumbnail blank while the rest populated).
+            self._thumb_worker.kill()
             self._thumb_worker.quit()
             self._thumb_worker.wait(2000)
         pending = [v.path for v in self._state.videos if not v.thumbnail_path]
